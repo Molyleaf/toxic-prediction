@@ -1,0 +1,114 @@
+@import url('https://fonts.googleapis.com/css2?family=Roboto:wght@400;500;700&display=swap');
+
+@keyframes fadeIn { from { opacity: 0; transform: scale(0.95); } to { opacity: 1; transform: scale(1); } }
+
+html, body {
+    height: 100%;
+    margin: 0;
+}
+
+body {
+    font-family: 'Roboto', sans-serif;
+    background: #f0f4f8;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    padding: 20px;
+    box-sizing: border-box;
+}
+
+.main-card {
+    max-width: 550px;
+    width: 100%;
+    border-radius: 12px;
+    box-shadow: 0 10px 30px rgba(0, 0, 0, 0.1);
+    animation: fadeIn 0.5s ease-in-out;
+    overflow: hidden;
+}
+
+.mdl-card__title { background-color: #4a90e2; color: #fff; }
+.mdl-card__title-text { font-size: 1.8rem; }
+.mdl-card__supporting-text { color: #555; padding: 16px 24px 24px 24px; }
+
+#drop-zone {
+    border: 2px dashed #ccc;
+    border-radius: 12px;
+    padding: 20px;
+    text-align: center;
+    cursor: pointer;
+    transition: all 0.3s ease;
+    margin-bottom: 20px;
+    position: relative;
+}
+#drop-zone.dragover {
+    border-color: #4a90e2;
+    background-color: #f0f8ff;
+}
+#drop-zone.file-selected {
+    border-color: #5cb85c;
+    background-color: #f0fff4;
+}
+#drop-zone .drop-zone-prompt p {
+    margin: 0;
+    color: #888;
+}
+#drop-zone .upload-icon {
+    font-size: 48px;
+    color: #4a90e2;
+}
+#drop-zone .success-icon {
+    font-size: 48px;
+    color: #5cb85c;
+}
+#file-input {
+    display: none;
+}
+
+.mdl-textfield { width: 100%; }
+.mdl-textfield__label { color: #888; }
+.mdl-textfield__input { border-bottom: 1px solid #ddd; }
+
+.predict-button-wrapper {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    margin-top: 24px;
+}
+
+.mdl-button--raised.mdl-button--colored {
+    background: #4a90e2;
+    transition: all 0.3s ease;
+}
+.mdl-button--raised.mdl-button--colored:hover {
+    background: #357abd;
+    box-shadow: 0 4px 10px rgba(0, 0, 0, 0.2);
+}
+.mdl-button:disabled { background-color: #ccc !important; cursor: not-allowed; }
+
+.predict-button-wrapper .mdl-spinner { margin-left: 16px; }
+.mdl-spinner__circle { border-color: #4a90e2; }
+
+.result-text { font-size: 2.8em; font-weight: bold; margin: 24px 0; padding: 16px; border-radius: 8px; }
+.result-text.toxic { color: #d9534f; background-color: rgba(217, 83, 79, 0.1); }
+.result-text.nontoxic { color: #5cb85c; background-color: rgba(92, 184, 92, 0.1); }
+.mdl-card__actions { display: flex; justify-content: center; }
+
+.flash-message { padding: 16px; margin-bottom: 16px; border-radius: 4px; color: #fff; background-color: #f44336; }
+
+/* result_all 表格和徽标 */
+.results-table-wrapper { overflow-x: auto; }
+.full-width { width: 100%; }
+.badge {
+  display: inline-block;
+  padding: 4px 10px;
+  border-radius: 999px;
+  font-weight: 600;
+}
+.badge.toxic {
+  color: #d9534f;
+  background-color: rgba(217, 83, 79, 0.12);
+}
+.badge.nontoxic {
+  color: #5cb85c;
+  background-color: rgba(92, 184, 92, 0.12);
+}

@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Toxicity Prediction</title>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/icon?family=Material+Icons">
+  <link rel="stylesheet" href="https://code.getmdl.io/1.3.0/material.indigo-pink.min.css">
+  <script defer src="https://code.getmdl.io/1.3.0/material.min.js"></script>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+  <div class="mdl-card mdl-shadow--6dp main-card">
+    <div class="mdl-card__title">
+      <h2 class="mdl-card__title-text">GenoToxMass: MS-Based Genotoxicity Prediction</h2>
+    </div>
+    <div class="mdl-card__supporting-text">
+      
+      {% with messages = get_flashed_messages() %}
+        {% if messages %}
+          <div class="flash-message">
+            {{ messages[0] }}
+          </div>
+        {% endif %}
+      {% endwith %}
+
+      <form action="/predict" method="post" enctype="multipart/form-data" id="prediction-form">
+        
+        <div id="drop-zone">
+          <div class="drop-zone-prompt">
+            <i class="material-icons upload-icon">cloud_upload</i>
+            <p>Drag and drop .xlsx file here, or click to select</p>
+          </div>
+          <input type="file" id="file-input" name="file" accept=".xlsx,.xls" required>
+        </div>
+
+        <div style="text-align: right; margin-top: -10px; margin-bottom: 20px;">
+          <a href="https://github.com/Molyleaf/MS-Data-Template" class="mdl-button mdl-js-button mdl-js-ripple-effect">
+            <i class="material-icons" style="vertical-align: middle; margin-right: 4px;">file_download</i>
+            Template (GitHub)
+          </a>
+        </div>
+
+        <!-- 模型选择（CatBoost 及 All） -->
+        <div style="margin: 10px 0 20px 0">
+          <span style="display:block; margin-bottom: 8px; color:#555;">Model</span>
+          <label class="mdl-radio mdl-js-radio mdl-js-ripple-effect" for="model_cb_1" style="margin-right:16px;">
+            <input type="radio" id="model_cb_1" class="mdl-radio__button" name="model_choice" value="cb_1">
+            <span class="mdl-radio__label">Model 1</span>
+          </label>
+          <label class="mdl-radio mdl-js-radio mdl-js-ripple-effect" for="model_cb_2" style="margin-right:16px;">
+            <input type="radio" id="model_cb_2" class="mdl-radio__button" name="model_choice" value="cb_2">
+            <span class="mdl-radio__label">Model 2</span>
+          </label>
+          <label class="mdl-radio mdl-js-radio mdl-js-ripple-effect" for="model_cb_3" style="margin-right:16px;">
+            <input type="radio" id="model_cb_3" class="mdl-radio__button" name="model_choice" value="cb_3">
+            <span class="mdl-radio__label">Model 3</span>
+          </label>
+          <label class="mdl-radio mdl-js-radio mdl-js-ripple-effect" for="model_cb_4" style="margin-right:16px;">
+            <input type="radio" id="model_cb_4" class="mdl-radio__button" name="model_choice" value="cb_4">
+            <span class="mdl-radio__label">Model 4</span>
+          </label>
+          <label class="mdl-radio mdl-js-radio mdl-js-ripple-effect" for="model_cb_5" style="margin-right:16px;">
+            <input type="radio" id="model_cb_5" class="mdl-radio__button" name="model_choice" value="cb_5" checked>
+            <span class="mdl-radio__label">Model 5</span>
+          </label>
+          <label class="mdl-radio mdl-js-radio mdl-js-ripple-effect" for="model_cb_all" style="margin-right:16px;">
+            <input type="radio" id="model_cb_all" class="mdl-radio__button" name="model_choice" value="cb_all">
+            <span class="mdl-radio__label">All Model</span>
+          </label>
+        </div>
+
+        <div class="mdl-textfield mdl-js-textfield mdl-textfield--floating-label">
+          <input class="mdl-textfield__input" type="text" pattern="-?[0-9]*(\.[0-9]+)?" name="retention_time" id="retention_time" value="" required>
+          <label class="mdl-textfield__label" for="retention_time">Retention Time (min)</label>
+          <span class="mdl-textfield__error">Please enter a valid number!</span>
+        </div>
+
+        <div class="mdl-textfield mdl-js-textfield mdl-textfield--floating-label">
+          <input class="mdl-textfield__input" type="text" pattern="-?[0-9]*(\.[0-9]+)?" name="collision_energy" id="collision_energy" value="" required>
+          <label class="mdl-textfield__label" for="collision_energy">Collision Energy (eV)</label>
+          <span class="mdl-textfield__error">Please enter a valid number!</span>
+        </div>
+
+        <div class="mdl-textfield mdl-js-textfield mdl-textfield--floating-label">
+          <input class="mdl-textfield__input" type="text" pattern="[01]" name="precursor_type" id="precursor_type" value="" required>
+          <label class="mdl-textfield__label" for="precursor_type">Precursor Type (1 for positive/ 0 for negative)</label>
+          <span class="mdl-textfield__error">Please enter 1 or 0!</span>
+        </div>
+        
+        <div class="predict-button-wrapper">
+            <button type="submit" id="predict-button" class="mdl-button mdl-js-button mdl-button--raised mdl-js-ripple-effect mdl-button--colored">
+                <span class="mdl-button__text">Predict</span>
+            </button>
+            <div id="loading-spinner" class="mdl-spinner mdl-js-spinner"></div>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <script src="{{ url_for('static', filename='script.js') }}" defer></script>
+</body>
+</html>
