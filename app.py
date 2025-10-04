@@ -7,7 +7,7 @@ from werkzeug.utils import secure_filename
 
 # --- 初始化 Flask App ---
 app = Flask(__name__)
-app.config['UPLOAD_FOLDER'] = 'uploads/'
+app.config['UPLOAD_FOLDER'] = '/tmp'
 app.config['SECRET_KEY'] = 'supersecretkey'  # 用于flash消息
 os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 
@@ -281,7 +281,7 @@ def predict():
                 # 若模型不支持 predict_proba，回退为硬预测
                 prob_toxic = float(prediction[0])
                 prob_nontoxic = 1.0 - prob_toxic
-            
+
             # --- 5. 返回结果（按阈值判定 Toxic/Nontoxic） ---
             THRESHOLD = 0.3  # 概率阈值：>= 0.3 判定为 Toxic
             is_toxic = prob_toxic >= THRESHOLD
