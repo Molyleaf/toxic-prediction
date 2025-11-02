@@ -7,6 +7,8 @@ import os
 from flask import Flask, request, render_template, flash, redirect, url_for
 from werkzeug.utils import secure_filename
 from catboost import CatBoostClassifier
+import threading
+import gc
 
 # --- 初始化 Flask App ---
 app = Flask(__name__, template_folder='templates', static_folder='static')
@@ -21,12 +23,18 @@ PREDICTION_THRESHOLD = float(os.environ.get("PREDICTION_THRESHOLD", 0.47))
 MODELS = {}
 SCALERS = {}
 
+# --- (新增) 缓存自动释放配置 ---
+CACHE_RELEASE_TIMER = None
+CACHE_TIMEOUT_SECONDS = int(os.environ.get("CACHE_TIMEOUT_SECONDS", 300))
+# --- 结束新增 ---
+
 # --- 核心修改：模型映射现在只包含 cb_5 ---
 MODEL_MAPPING = {
     'cb_5': {'model': 'models/cb_best_5.cbm', 'scaler': 'models/scaler_5.joblib', 'name': 'Model 5'},
 }
 # 始终使用 Model 5
 DEFAULT_MODEL_CHOICE = 'cb_5'
+
 
 def get_model_by_choice(choice_key: str):
     """
@@ -74,6 +82,39 @@ def get_scaler_by_choice(choice_key: str):
     scaler_obj = joblib.load(scaler_file)
     SCALERS[choice_key] = scaler_obj
     return scaler_obj
+
+# --- (新增) 缓存自动释放函数 ---
+def clear_caches():
+    """(新增) 清空模型和Scaler缓存并运行垃圾回收。"""
+    global MODELS, SCALERS, CACHE_RELEASE_TIMER
+
+    if not MODELS and not SCALERS:
+        # print("缓存已为空，无需释放。") # 调试信息
+        return
+
+    print(f"检测到 {CACHE_TIMEOUT_SECONDS} 秒无活动，正在释放模型/scaler缓存...")
+    try:
+        MODELS.clear()
+        SCALERS.clear()
+        gc.collect() # 提示进行垃圾回收
+        CACHE_RELEASE_TIMER = None # 清空计时器
+        print("缓存已成功释放。")
+    except Exception as e:
+        print(f"释放缓存时出错: {e}")
+
+def reset_cache_timer():
+    """(新增) 重置缓存释放计时器。"""
+    global CACHE_RELEASE_TIMER
+
+    # 如果存在旧的计时器，取消它
+    if CACHE_RELEASE_TIMER:
+        CACHE_RELEASE_TIMER.cancel()
+
+    # 创建并启动一个新的计时器
+    CACHE_RELEASE_TIMER = threading.Timer(CACHE_TIMEOUT_SECONDS, clear_caches)
+    CACHE_RELEASE_TIMER.start()
+    # print("缓存释放计时器已重置。") # 调试信息
+# --- 结束新增 ---
 
 
 # --- 工具函数：自动截断表头以上的行，并设置表头 ---
@@ -167,6 +208,11 @@ def index():
 @app.route('/predict', methods=['POST'])
 def predict():
     # ... (此函数无需修改) ...
+
+    # --- (新增) 收到识别请求，重置内存释放计时器 ---
+    reset_cache_timer()
+    # --- 结束新增 ---
+
     if 'file' not in request.files:
         flash('未找到文件部分')
         return redirect(url_for('index'))
