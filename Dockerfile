@@ -1,5 +1,5 @@
 # 1. 基础镜像
-FROM python:3.13-slim
+FROM python:3.13-slim-trixie
 
 # 2. 设置工作目录
 WORKDIR /app
@@ -15,8 +15,6 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 COPY requirements.txt .
 
 # 6. 安装系统依赖
-# 先切换为南京大学镜像源以加速下载，然后安装必要的系统库
-# 默认使用 root 用户执行系统级操作
 USER root
 
 # 更换 APT 源
@@ -25,14 +23,16 @@ RUN rm -f /etc/apt/sources.list \
 COPY sources.list /etc/apt/sources.list
 
 # 安装系统依赖（作为 root）
-RUN apt-get update && apt-get install -y \
-    libgomp1 libstdc++6 libtbb2 \
+RUN apt update && apt install -y \
+    libgomp1 libstdc++6 libtbbmalloc2 \
     && rm -rf /var/lib/apt/lists/*
 
 # 7. 安装 Python 依赖
 # 设置 pip 镜像源并安装依赖
-RUN pip config set global.index-url https://mirror.pku.edu.cn/pypi/web/simple \
- && pip install --no-cache-dir -r requirements.txt
+RUN pip config set global.index-url https://mirrors.pku.edu.cn/pypi/simple \
+ && pip install --no-cache-dir -r requirements.txt \
+ && apt autoremove -y \
+ && apt autoclean -y
 
 # 8. 创建一个无特权的 appuser 用户 (uid:2000) 和 appgroup 组 (gid:2000)
 RUN groupadd -g 2000 appgroup && useradd -r -u 2000 -g appgroup appuser

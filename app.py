@@ -21,14 +21,12 @@ PREDICTION_THRESHOLD = float(os.environ.get("PREDICTION_THRESHOLD", 0.47))
 MODELS = {}
 SCALERS = {}
 
-# --- 核心修改：模型映射现在指向 .cbm 文件 ---
+# --- 核心修改：模型映射现在只包含 cb_5 ---
 MODEL_MAPPING = {
-    'cb_1': {'model': 'models/cb_best_1.cbm', 'scaler': 'models/scaler_1.joblib', 'name': 'Model 1'},
-    'cb_2': {'model': 'models/cb_best_2.cbm', 'scaler': 'models/scaler_2.joblib', 'name': 'Model 2'},
-    'cb_3': {'model': 'models/cb_best_3.cbm', 'scaler': 'models/scaler_3.joblib', 'name': 'Model 3'},
-    'cb_4': {'model': 'models/cb_best_4.cbm', 'scaler': 'models/scaler_4.joblib', 'name': 'Model 4'},
     'cb_5': {'model': 'models/cb_best_5.cbm', 'scaler': 'models/scaler_5.joblib', 'name': 'Model 5'},
 }
+# 始终使用 Model 5
+DEFAULT_MODEL_CHOICE = 'cb_5'
 
 def get_model_by_choice(choice_key: str):
     """
@@ -183,11 +181,10 @@ def predict():
     except (ValueError, TypeError):
         flash('输入的参数格式不正确，请输入数字。')
         return redirect(url_for('index'))
-    model_choice = request.form.get('model_choice', 'cb_5')
-    valid_choices = ('cb_1', 'cb_2', 'cb_3', 'cb_4', 'cb_5', 'cb_all')
-    if model_choice not in valid_choices:
-        flash('无效的模型选择。当前支持 CatBoost dataset 1~5 或 All。')
-        return redirect(url_for('index'))
+
+    # --- 核心修改：硬编码使用 cb_5，移除模型选择逻辑 ---
+    model_choice = DEFAULT_MODEL_CHOICE
+    # --- 结束修改 ---
 
     if file:
         filename = secure_filename(file.filename)
@@ -238,29 +235,12 @@ def predict():
             features_df = features_df[feature_order]
 
             # --- 4. 标准化和预测 ---
-            if model_choice == 'cb_all':
-                results = []
-                threshold_to_use = PREDICTION_THRESHOLD
-                for ck in ['cb_1', 'cb_2', 'cb_3', 'cb_4', 'cb_5']:
-                    scaler = get_scaler_by_choice(ck)
-                    scaled_features = scaler.transform(features_df)
-                    model = get_model_by_choice(ck)
-                    prob_nontoxic, prob_toxic = run_prediction(model, scaled_features)
-                    label = "Toxic" if prob_toxic >= threshold_to_use else "Nontoxic"
-                    results.append({
-                        'model_key': ck,
-                        'model_name': MODEL_MAPPING[ck]['name'],
-                        'label': label,
-                        'proba_toxic': prob_toxic,
-                        'proba_nontoxic': prob_nontoxic
-                    })
-                return render_template('result_all.html', results=results)
-
-            # 单模型路径
+            # --- 核心修改：移除 'cb_all' 逻辑 ---
             scaler = get_scaler_by_choice(model_choice)
             scaled_features = scaler.transform(features_df)
             model = get_model_by_choice(model_choice)
             prob_nontoxic, prob_toxic = run_prediction(model, scaled_features)
+            # --- 结束修改 ---
 
             # --- 5. 返回结果 ---
             threshold_to_use = PREDICTION_THRESHOLD
