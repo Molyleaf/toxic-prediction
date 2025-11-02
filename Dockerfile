@@ -26,7 +26,7 @@ COPY sources.list /etc/apt/sources.list
 
 # 安装系统依赖（作为 root）
 RUN apt-get update && apt-get install -y \
-    libgomp1 libstdc++6 \
+    libgomp1 libstdc++6 libtbb2 \
     && rm -rf /var/lib/apt/lists/*
 
 # 7. 安装 Python 依赖
