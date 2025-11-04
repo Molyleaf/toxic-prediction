@@ -18,9 +18,9 @@ COPY requirements.txt .
 USER root
 
 # 更换 APT 源
-RUN rm -f /etc/apt/sources.list \
-    && rm -rf /etc/apt/sources.list.d/
-COPY sources.list /etc/apt/sources.list
+# RUN rm -f /etc/apt/sources.list \
+# && rm -rf /etc/apt/sources.list.d/
+# COPY sources.list /etc/apt/sources.list
 
 # 安装系统依赖（作为 root）
 RUN apt update && apt install -y \
@@ -29,8 +29,8 @@ RUN apt update && apt install -y \
 
 # 7. 安装 Python 依赖
 # 设置 pip 镜像源并安装依赖
-RUN pip config set global.index-url https://mirrors.pku.edu.cn/pypi/simple \
- && pip install --no-cache-dir -r requirements.txt \
+## RUN pip config set global.index-url https://mirrors.pku.edu.cn/pypi/simple \
+RUN pip install --no-cache-dir -r requirements.txt \
  && apt autoremove -y \
  && apt autoclean -y
 
