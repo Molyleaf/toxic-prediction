@@ -11,7 +11,7 @@ import threading
 import gc
 
 # --- 初始化 Flask App ---
-URL_PREFIX = '/genetoxic'
+URL_PREFIX = '/genotoxic'
 
 app = Flask(__name__, template_folder='templates', static_folder='static',
             static_url_path=f"{URL_PREFIX}/static")

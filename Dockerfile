@@ -29,7 +29,8 @@ RUN apt update && apt install -y \
 
 # 7. 安装 Python 依赖
 # 设置 pip 镜像源并安装依赖
-RUN pip config set global.index-url https://mirrors.zju.edu.cn/pypi/web/simple \
+RUN pip config set global.index-url https://mirrors.zju.edu.cn/pypi/web/simple
+
 RUN pip install --no-cache-dir -r requirements.txt \
  && apt autoremove -y \
  && apt autoclean -y
