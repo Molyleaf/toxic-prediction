@@ -11,7 +11,10 @@ import threading
 import gc
 
 # --- 初始化 Flask App ---
-app = Flask(__name__, template_folder='templates', static_folder='static')
+URL_PREFIX = '/genetoxic'
+
+app = Flask(__name__, template_folder='templates', static_folder='static',
+            static_url_path=f"{URL_PREFIX}/static")
 app.config['UPLOAD_FOLDER'] = '/tmp'
 app.config['SECRET_KEY'] = 'supersecretkey'
 os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
@@ -119,7 +122,6 @@ def reset_cache_timer():
 
 # --- 工具函数：自动截断表头以上的行，并设置表头 ---
 def load_excel_with_header_cleanup(path):
-    # ... (此函数无需修改) ...
     try:
         raw = pd.read_excel(path, header=None)
     except Exception as read_err:
@@ -200,12 +202,24 @@ def run_prediction(model, scaled_features):
 
 
 # --- Flask 路由 ---
+
+# --- 兼容：旧根路径重定向到前缀路径 ---
 @app.route('/', methods=['GET'])
+def root_redirect():
+    return redirect(url_for('index'))
+
+@app.route('/predict', methods=['POST'])
+def predict_legacy():
+    return predict()
+
+
+@app.route(f"{URL_PREFIX}/", methods=['GET'])
+@app.route(f"{URL_PREFIX}", methods=['GET'])
 def index():
     return render_template('index.html')
 
 
-@app.route('/predict', methods=['POST'])
+@app.route(f"{URL_PREFIX}/predict", methods=['POST'])
 def predict():
     # ... (此函数无需修改) ...
 
