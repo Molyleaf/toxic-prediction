@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import json
 import platform
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Optional
 
+import joblib
 import numpy as np
 import pandas as pd
 from sklearn.model_selection import train_test_split
@@ -313,6 +315,8 @@ def prepare_lightgbm_training_data(
         "X_test": X_test_processed,
         "y_train": y_train_resampled,
         "y_test": y_test.reset_index(drop=True),
+        "raw_feature_columns": X.columns.tolist(),
+        "model_feature_columns": X_test_processed.columns.tolist(),
         "scaler": scaler,
         "continuous_features": continuous_features,
         "discrete_features": discrete_features,
@@ -394,3 +398,85 @@ def build_lgbm_classifier(
         min_split_gain=0.05,
         verbosity=-1,
     )
+
+
+def _make_json_safe(value: Any) -> Any:
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, dict):
+        return {str(key): _make_json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_make_json_safe(item) for item in value]
+    if isinstance(value, np.generic):
+        return value.item()
+    return value
+
+
+def save_lightgbm_inference_artifacts(
+    estimator: Any,
+    prepared: Dict[str, Any],
+    model_path: Path,
+    preprocessor_path: Path,
+    manifest_path: Path,
+    *,
+    target_column: str = DEFAULT_TARGET_COLUMN,
+    data_path: Optional[Path] = None,
+    random_seed: Optional[int] = None,
+    test_size: Optional[float] = None,
+    smote_k_neighbors: Optional[int] = None,
+    scoring: Optional[str] = None,
+    classification_threshold: float = 0.5,
+) -> Dict[str, Path]:
+    model_path = Path(model_path)
+    preprocessor_path = Path(preprocessor_path)
+    manifest_path = Path(manifest_path)
+
+    for path in (model_path, preprocessor_path, manifest_path):
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+    estimator.booster_.save_model(str(model_path))
+
+    preprocessor_bundle = {
+        "artifacts_version": 1,
+        "target_column": target_column,
+        "raw_feature_columns": prepared["raw_feature_columns"],
+        "model_feature_columns": prepared["model_feature_columns"],
+        "continuous_features": prepared["continuous_features"],
+        "discrete_features": prepared["discrete_features"],
+        "numeric_fill_values": prepared["numeric_fill_values"],
+        "categorical_fill_values": prepared["categorical_fill_values"],
+        "scaler": prepared["scaler"],
+        "classes_": list(getattr(estimator, "classes_", [])),
+        "classification_threshold": classification_threshold,
+    }
+    joblib.dump(preprocessor_bundle, preprocessor_path)
+
+    manifest = {
+        "artifacts_version": 1,
+        "model_path": model_path,
+        "preprocessor_path": preprocessor_path,
+        "target_column": target_column,
+        "data_path": data_path,
+        "raw_feature_columns": prepared["raw_feature_columns"],
+        "model_feature_columns": prepared["model_feature_columns"],
+        "continuous_features": prepared["continuous_features"],
+        "discrete_features": prepared["discrete_features"],
+        "numeric_fill_values": prepared["numeric_fill_values"],
+        "categorical_fill_values": prepared["categorical_fill_values"],
+        "classes_": list(getattr(estimator, "classes_", [])),
+        "classification_threshold": classification_threshold,
+        "random_seed": random_seed,
+        "test_size": test_size,
+        "smote_k_neighbors": smote_k_neighbors,
+        "scoring": scoring,
+    }
+    manifest_path.write_text(
+        json.dumps(_make_json_safe(manifest), ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+    return {
+        "model_path": model_path,
+        "preprocessor_path": preprocessor_path,
+        "manifest_path": manifest_path,
+    }

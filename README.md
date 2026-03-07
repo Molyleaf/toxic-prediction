@@ -17,6 +17,7 @@ The core of this project is a mass-spectrometry-based toxicity classifier. The r
 * **Notebook-first Training Flow**: the notebook is organized into config/imports, pre-training diagnostics, and a single training-and-save block.
 * **Notebook Progress Bar**: BayesSearchCV progress is shown in the notebook through `tqdm.auto`.
 * **Native LightGBM Export**: the best trained booster is saved to `models/lightgbm_cuda_model.txt`.
+* **Inference Artifact Bundle**: preprocessing state is saved alongside the model in `models/lightgbm_cuda_preprocessor.joblib` and `models/lightgbm_cuda_inference_assets.json`.
 * **Web Interface**: Provides a simple and user-friendly frontend for making predictions.
 * **Containerized**: Includes a `Dockerfile` for quick and easy deployment using Docker.
 
@@ -114,10 +115,10 @@ Key behavior:
 
 * Training is locked to `cuda`.
 * CPU fallback is disabled on purpose.
-* The first code cell centralizes imports, path fixes, `NOTEBOOK_*` globals, and the output path for the saved model.
+* The first code cell centralizes imports, path fixes, `NOTEBOOK_*` globals, and the output paths for all inference artifacts.
 * `NOTEBOOK_CONFIG` is built from those globals, so edit that first cell and rerun the notebook from the top when you want to change training behavior.
 * The second code cell runs data loading, preprocessing, and consolidated diagnostics before any fitting starts.
-* The third code cell runs the only BayesSearchCV training pass, shows a `tqdm.auto` progress bar, evaluates the best estimator, and saves it in native LightGBM format.
+* The third code cell runs the only BayesSearchCV training pass, shows a `tqdm.auto` progress bar, evaluates the best estimator, and saves the full inference artifact bundle.
 
 Main globals in the first notebook cell:
 
@@ -145,6 +146,14 @@ The notebook training flow covers:
 * a full BayesSearchCV training loop with stronger regularization to reduce overfitting
 * notebook progress tracking through `tqdm.auto`
 * exporting the best booster to `models/lightgbm_cuda_model.txt`
+* exporting preprocessing state to `models/lightgbm_cuda_preprocessor.joblib`
+* exporting an inference manifest to `models/lightgbm_cuda_inference_assets.json`
+
+The downstream inference bundle consists of:
+
+* `models/lightgbm_cuda_model.txt`: native LightGBM booster
+* `models/lightgbm_cuda_preprocessor.joblib`: fitted scaler, fill values, feature grouping, and feature order
+* `models/lightgbm_cuda_inference_assets.json`: human-readable manifest of the saved inference assets
 
 If the installed `lightgbm` package was not compiled with CUDA support, the notebook will fail fast with an explicit error instead of silently falling back to CPU.
 
