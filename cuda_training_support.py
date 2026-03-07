@@ -351,7 +351,7 @@ def clean_retention_time_series(
 
     cleaned = pd.Series(cleaned_values, index=series.index, dtype="float64", name=series.name)
     cleaned_missing_count = int(cleaned.isna().sum())
-    strict_missing_count = int(strict_numeric.isna().sum())
+    strict_missing_count = int(pd.isna(strict_numeric).sum())
 
     diagnostics = {
         "row_count": int(len(series)),
