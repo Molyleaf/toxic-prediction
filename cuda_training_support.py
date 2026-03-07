@@ -305,6 +305,71 @@ def clean_retention_time_series(
     return cleaned, diagnostics
 
 
+def _replace_dataframe_column(
+    frame: pd.DataFrame,
+    column: str,
+    values: pd.Series | np.ndarray | list[Any],
+) -> pd.DataFrame:
+    updated = frame.copy()
+    updated[column] = values
+    return updated
+
+
+def _normalize_categorical_series(
+    series: pd.Series,
+    fill_value: Any,
+) -> pd.Series:
+    return series.fillna(fill_value).astype("string")
+
+
+def _fit_categorical_encoders(
+    X_df: pd.DataFrame,
+    categorical_features: list[str],
+    categorical_fill_values: Dict[str, Any],
+) -> tuple[Dict[str, Dict[str, int]], Dict[str, int]]:
+    categorical_encoders: Dict[str, Dict[str, int]] = {}
+    categorical_unknown_values: Dict[str, int] = {}
+
+    for column in categorical_features:
+        normalized_values = _normalize_categorical_series(
+            X_df[column],
+            categorical_fill_values[column],
+        )
+        categories = sorted(normalized_values.dropna().unique().tolist())
+        categorical_encoders[column] = {
+            category: category_code
+            for category_code, category in enumerate(categories)
+        }
+        categorical_unknown_values[column] = -1
+
+    return categorical_encoders, categorical_unknown_values
+
+
+def _encode_categorical_features(
+    X_df: pd.DataFrame,
+    categorical_features: list[str],
+    categorical_fill_values: Dict[str, Any],
+    categorical_encoders: Dict[str, Dict[str, int]],
+    categorical_unknown_values: Dict[str, int],
+) -> pd.DataFrame:
+    encoded = pd.DataFrame(index=X_df.index)
+
+    for column in categorical_features:
+        if column not in categorical_encoders:
+            raise ValueError(f"预处理器缺少离散列 {column} 的编码映射，请重新训练模型。")
+
+        normalized_values = _normalize_categorical_series(
+            X_df[column],
+            categorical_fill_values[column],
+        )
+        unknown_value = int(categorical_unknown_values.get(column, -1))
+        encoded[column] = (
+            normalized_values.map(categorical_encoders[column]).fillna(unknown_value).astype("int32")
+        )
+
+    return encoded
+
+
 def _fit_lightgbm_preprocessor(X: pd.DataFrame) -> Dict[str, Any]:
     X_df = X.copy() if isinstance(X, pd.DataFrame) else pd.DataFrame(X)
 
@@ -313,7 +378,11 @@ def _fit_lightgbm_preprocessor(X: pd.DataFrame) -> Dict[str, Any]:
         cleaned_retention_time, retention_time_diagnostics = clean_retention_time_series(
             X_df[RETENTION_TIME_COLUMN]
         )
-        X_df.loc[:, RETENTION_TIME_COLUMN] = cleaned_retention_time
+        X_df = _replace_dataframe_column(
+            X_df,
+            RETENTION_TIME_COLUMN,
+            cleaned_retention_time.astype("float64"),
+        )
 
     raw_feature_columns = X_df.columns.tolist()
     numeric_features = X_df.select_dtypes(include=["number"]).columns.tolist()
@@ -331,6 +400,11 @@ def _fit_lightgbm_preprocessor(X: pd.DataFrame) -> Dict[str, Any]:
 
     continuous_features = numeric_features.copy()
     discrete_features = categorical_features.copy()
+    categorical_encoders, categorical_unknown_values = _fit_categorical_encoders(
+        X_df,
+        discrete_features,
+        categorical_fill_values,
+    )
 
     scaler = None
     if continuous_features:
@@ -349,8 +423,11 @@ def _fit_lightgbm_preprocessor(X: pd.DataFrame) -> Dict[str, Any]:
         "model_feature_columns": continuous_features + discrete_features,
         "continuous_features": continuous_features,
         "discrete_features": discrete_features,
+        "categorical_feature_columns": discrete_features.copy(),
         "numeric_fill_values": numeric_fill_values,
         "categorical_fill_values": categorical_fill_values,
+        "categorical_encoders": categorical_encoders,
+        "categorical_unknown_values": categorical_unknown_values,
         "scaler": scaler,
         "retention_time_column": RETENTION_TIME_COLUMN if RETENTION_TIME_COLUMN in X_df.columns else None,
         "retention_time_multi_value_strategy": "mean",
@@ -373,10 +450,17 @@ def transform_lightgbm_features(
     retention_time_column = preprocessor.get("retention_time_column")
     if retention_time_column and retention_time_column in X_aligned.columns:
         cleaned_retention_time, _ = clean_retention_time_series(X_aligned[retention_time_column])
-        X_aligned.loc[:, retention_time_column] = cleaned_retention_time
+        X_aligned = _replace_dataframe_column(
+            X_aligned,
+            retention_time_column,
+            cleaned_retention_time.astype("float64"),
+        )
 
     continuous_features = preprocessor["continuous_features"]
     discrete_features = preprocessor["discrete_features"]
+    categorical_fill_values = preprocessor.get("categorical_fill_values", {})
+    categorical_encoders = preprocessor.get("categorical_encoders", {})
+    categorical_unknown_values = preprocessor.get("categorical_unknown_values", {})
 
     if continuous_features:
         for column in continuous_features:
@@ -386,11 +470,6 @@ def transform_lightgbm_features(
             ).astype("float64")
         X_aligned.loc[:, continuous_features] = X_aligned[continuous_features].fillna(
             preprocessor["numeric_fill_values"]
-        )
-
-    if discrete_features:
-        X_aligned.loc[:, discrete_features] = X_aligned[discrete_features].fillna(
-            preprocessor["categorical_fill_values"]
         )
 
     processed = pd.DataFrame(index=X_aligned.index)
@@ -404,7 +483,14 @@ def transform_lightgbm_features(
         )
 
     if discrete_features:
-        processed = pd.concat([processed, X_aligned[discrete_features]], axis=1)
+        encoded_discrete = _encode_categorical_features(
+            X_aligned,
+            discrete_features,
+            categorical_fill_values,
+            categorical_encoders,
+            categorical_unknown_values,
+        )
+        processed = pd.concat([processed, encoded_discrete], axis=1)
 
     processed = processed.loc[:, preprocessor["model_feature_columns"]]
     if processed.isna().any().any():
@@ -907,6 +993,9 @@ class FoldSafeSmoteLGBMClassifier(BaseEstimator, ClassifierMixin):
                     )
                 ],
             }
+        categorical_feature_columns = self.preprocessor_bundle_.get("categorical_feature_columns", [])
+        if categorical_feature_columns:
+            fit_kwargs["categorical_feature"] = categorical_feature_columns
 
         self.model_.fit(X_model_fit, y_model_fit, **fit_kwargs)
         self.classes_ = getattr(self.model_, "classes_", np.sort(y_series.unique()))
@@ -946,7 +1035,11 @@ def prepare_lightgbm_training_data(
         cleaned_retention_time, retention_time_diagnostics = clean_retention_time_series(
             frame[RETENTION_TIME_COLUMN]
         )
-        frame.loc[:, RETENTION_TIME_COLUMN] = cleaned_retention_time
+        frame = _replace_dataframe_column(
+            frame,
+            RETENTION_TIME_COLUMN,
+            cleaned_retention_time.astype("float64"),
+        )
 
     X = frame.drop([target_column], axis=1)
     y = frame[target_column]
@@ -1139,6 +1232,10 @@ def save_lightgbm_inference_artifacts(
             "discrete_features",
             prepared.get("discrete_features", []),
         ),
+        "categorical_feature_columns": estimator_preprocessor.get(
+            "categorical_feature_columns",
+            prepared.get("categorical_feature_columns", []),
+        ),
         "numeric_fill_values": estimator_preprocessor.get(
             "numeric_fill_values",
             prepared.get("numeric_fill_values", {}),
@@ -1146,6 +1243,14 @@ def save_lightgbm_inference_artifacts(
         "categorical_fill_values": estimator_preprocessor.get(
             "categorical_fill_values",
             prepared.get("categorical_fill_values", {}),
+        ),
+        "categorical_encoders": estimator_preprocessor.get(
+            "categorical_encoders",
+            prepared.get("categorical_encoders", {}),
+        ),
+        "categorical_unknown_values": estimator_preprocessor.get(
+            "categorical_unknown_values",
+            prepared.get("categorical_unknown_values", {}),
         ),
         "scaler": estimator_preprocessor.get("scaler", prepared.get("scaler")),
         "retention_time_column": estimator_preprocessor.get("retention_time_column"),
@@ -1182,8 +1287,11 @@ def save_lightgbm_inference_artifacts(
         "model_feature_columns": preprocessor_bundle["model_feature_columns"],
         "continuous_features": preprocessor_bundle["continuous_features"],
         "discrete_features": preprocessor_bundle["discrete_features"],
+        "categorical_feature_columns": preprocessor_bundle["categorical_feature_columns"],
         "numeric_fill_values": preprocessor_bundle["numeric_fill_values"],
         "categorical_fill_values": preprocessor_bundle["categorical_fill_values"],
+        "categorical_encoders": preprocessor_bundle["categorical_encoders"],
+        "categorical_unknown_values": preprocessor_bundle["categorical_unknown_values"],
         "retention_time_column": preprocessor_bundle["retention_time_column"],
         "retention_time_multi_value_strategy": preprocessor_bundle[
             "retention_time_multi_value_strategy"
