@@ -1,15 +1,20 @@
 # Toxic-Prediction: Genotoxicity Prediction Model
 
-This is a machine learning model trained on Massbank data to predict the genotoxicity of chemical substances. The repository includes the pre-trained model and a web frontend for interaction.
+This is a machine learning project for predicting the genotoxicity of chemical substances from Massbank-derived features. The repository includes a pre-trained inference model, a web frontend, and a CUDA-only LightGBM training notebook.
 
 ## Overview
 
-The core of this project is a machine learning/deep learning model trained on mass spectrometry data (from Massbank) to assess the potential genotoxicity of chemical compounds. This repository provides not only the pre-trained model files but also a complete web application, including a Python-based backend (likely Flask or FastAPI) and a user interface.
+The core of this project is a mass-spectrometry-based toxicity classifier. The repository contains two separate paths:
+
+* **Inference path**: a Flask web application that serves a pre-trained CatBoost model.
+* **Training path**: a LightGBM notebook under `lightgbm/light_model.ipynb` that now runs in **CUDA-only** mode and refuses any silent CPU fallback.
 
 ## ✨ Features
 
 * **Genotoxicity Prediction**: Predicts substance genotoxicity based on mass spectrometry data.
 * **Pre-trained Model**: Includes a ready-to-use model trained on the Massbank dataset.
+* **CUDA-only Training Notebook**: LightGBM training is pinned to `device_type='cuda'` and performs a preflight check before any real training starts.
+* **Smoke Validation Script**: `check_lgbm_cuda_pipeline.py` verifies the training chain on a reduced sample instead of launching a full search.
 * **Web Interface**: Provides a simple and user-friendly frontend for making predictions.
 * **Containerized**: Includes a `Dockerfile` for quick and easy deployment using Docker.
 
@@ -17,7 +22,8 @@ The core of this project is a machine learning/deep learning model trained on ma
 
 * **Backend**: Python (Inferred from `app.py` and `requirements.txt`, likely Flask / FastAPI)
 * **Frontend**: HTML, CSS, JavaScript (Located in `static` and `templates`)
-* **Model**: (Located in `models`, e.g., Scikit-learn, TensorFlow, PyTorch)
+* **Training Model**: LightGBM (`lightgbm/light_model.ipynb`, CUDA-only)
+* **Inference Model**: CatBoost (`models/`)
 * **Deployment**: Docker
 
 ## 📂 Project Structure
@@ -25,9 +31,12 @@ The core of this project is a machine learning/deep learning model trained on ma
 ```
 
 .
-├── models/            \# Stores pre-trained model files
+├── lightgbm/          \# Training notebook and training dataset
+├── models/            \# Stores pre-trained inference model files
 ├── static/            \# Stores static assets (CSS, JS, images)
 ├── templates/         \# Stores HTML templates
+├── cuda_training_support.py   \# Shared CUDA-only training helpers
+├── check_lgbm_cuda_pipeline.py \# Reduced-scope training smoke test
 ├── .idea/             \# IDE configuration (can be ignored)
 ├── app.py             \# Main application backend script
 ├── Dockerfile         \# Docker configuration file
@@ -59,6 +68,8 @@ source venv/bin/activate  # On Windows: venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
+For the training notebook, `lightgbm` must be a **CUDA-enabled** build. A CPU-only build is intentionally rejected during preflight and will stop the notebook / smoke script immediately.
+
 **d. Run the application**
 
 ```bash
@@ -67,9 +78,42 @@ python app.py
 
 After launching, open your browser and navigate to `http://127.0.0.1:5000` (or the port specified in the console) to use the application.
 
------
+### 2. CUDA Training Notebook
 
-### 2\. Running with Docker
+The training notebook is located at `lightgbm/light_model.ipynb`.
+
+Key behavior:
+
+* Training is locked to `cuda`.
+* CPU fallback is disabled on purpose.
+* The notebook defaults to a **smoke** configuration so you can validate the pipeline without launching a full search.
+
+Useful environment variables:
+
+```bash
+LGBM_NOTEBOOK_RUN_MODE=smoke   # or full
+LGBM_SMOKE_SAMPLE_SIZE=1024
+LGBM_BAYES_N_ITER=2
+LGBM_CV_FOLDS=2
+```
+
+Before running the full notebook, use the reduced-scope smoke test:
+
+```bash
+python check_lgbm_cuda_pipeline.py
+```
+
+What the smoke test covers:
+
+* CSV loading
+* feature preprocessing
+* notebook-local SMOTE replacement
+* CUDA preflight for LightGBM
+* a reduced BayesSearchCV training loop
+
+If the installed `lightgbm` package was not compiled with CUDA support, the script and notebook will fail fast with an explicit error instead of silently falling back to CPU.
+
+### 3\. Running with Docker
 
 If you have Docker installed, you can run the project with these commands.
 
