@@ -1,8 +1,9 @@
-flask==3.1.2
-pandas==2.3.3
-numpy==2.2.6
-scikit-learn==1.7.2
-scikit-learn-intelex==2025.9.0
-openpyxl==3.1.5
-gunicorn==23.0.0
-catboost==1.2.8
+flask
+pandas
+numpy
+scikit-learn
+scikit-learn-intelex
+openpyxl
+gunicorn
+catboost
+scikit-optimize
