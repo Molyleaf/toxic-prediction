@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 import platform
 from dataclasses import dataclass
 from pathlib import Path
@@ -37,6 +36,7 @@ class NotebookRunConfig:
     test_size: float
     model_n_jobs: int
     search_n_jobs: int
+    smote_k_neighbors: int
 
 
 def format_notebook_run_summary(
@@ -52,6 +52,7 @@ def format_notebook_run_summary(
         f"CV folds: {config.cv_folds}",
         f"模型 n_jobs: {config.model_n_jobs}",
         f"搜索 n_jobs: {config.search_n_jobs}",
+        f"SMOTE k_neighbors: {config.smote_k_neighbors}",
     ]
     if data_path is not None:
         lines.insert(1, f"数据文件: {data_path}")
@@ -107,37 +108,43 @@ def build_notebook_run_config(
     cv_folds: Optional[int] = None,
     random_seed: Optional[int] = None,
     test_size: Optional[float] = None,
+    model_n_jobs: Optional[int] = None,
+    search_n_jobs: Optional[int] = None,
+    smote_k_neighbors: Optional[int] = None,
 ) -> NotebookRunConfig:
-    resolved_run_mode = (run_mode or os.environ.get("LGBM_NOTEBOOK_RUN_MODE", "smoke")).strip().lower()
+    resolved_run_mode = (run_mode if run_mode is not None else "smoke").strip().lower()
     if resolved_run_mode not in {"smoke", "full"}:
-        raise ValueError("LGBM_NOTEBOOK_RUN_MODE 只能是 'smoke' 或 'full'。")
+        raise ValueError("run_mode 只能是 'smoke' 或 'full'。")
 
-    resolved_random_seed = int(random_seed or os.environ.get("LGBM_RANDOM_SEED", "42"))
-    resolved_test_size = float(test_size or os.environ.get("LGBM_TEST_SIZE", "0.2"))
+    resolved_random_seed = int(42 if random_seed is None else random_seed)
+    resolved_test_size = float(0.2 if test_size is None else test_size)
 
     default_sample_size = 1024 if resolved_run_mode == "smoke" else 0
-    resolved_sample_size = int(sample_size or os.environ.get("LGBM_SMOKE_SAMPLE_SIZE", str(default_sample_size)))
+    resolved_sample_size = int(default_sample_size if sample_size is None else sample_size)
 
     default_bayes_n_iter = 2 if resolved_run_mode == "smoke" else 32
-    resolved_bayes_n_iter = int(bayes_n_iter or os.environ.get("LGBM_BAYES_N_ITER", str(default_bayes_n_iter)))
+    resolved_bayes_n_iter = int(default_bayes_n_iter if bayes_n_iter is None else bayes_n_iter)
 
     default_cv_folds = 2 if resolved_run_mode == "smoke" else 5
-    resolved_cv_folds = int(cv_folds or os.environ.get("LGBM_CV_FOLDS", str(default_cv_folds)))
+    resolved_cv_folds = int(default_cv_folds if cv_folds is None else cv_folds)
 
     # GPU 训练与交叉验证并发通常会争抢同一张卡，这里默认串行执行搜索。
-    resolved_model_n_jobs = int(os.environ.get("LGBM_MODEL_N_JOBS", "1"))
-    resolved_search_n_jobs = int(os.environ.get("LGBM_SEARCH_N_JOBS", "1"))
+    resolved_model_n_jobs = int(1 if model_n_jobs is None else model_n_jobs)
+    resolved_search_n_jobs = int(1 if search_n_jobs is None else search_n_jobs)
+    resolved_smote_k_neighbors = int(5 if smote_k_neighbors is None else smote_k_neighbors)
 
     if resolved_sample_size < 0:
-        raise ValueError("LGBM_SMOKE_SAMPLE_SIZE 不能为负数。")
+        raise ValueError("sample_size 不能为负数。")
     if resolved_bayes_n_iter <= 0:
-        raise ValueError("LGBM_BAYES_N_ITER 必须为正整数。")
+        raise ValueError("bayes_n_iter 必须为正整数。")
     if resolved_cv_folds <= 1:
-        raise ValueError("LGBM_CV_FOLDS 至少为 2。")
+        raise ValueError("cv_folds 至少为 2。")
     if not 0.0 < resolved_test_size < 1.0:
-        raise ValueError("LGBM_TEST_SIZE 必须在 0 和 1 之间。")
+        raise ValueError("test_size 必须在 0 和 1 之间。")
     if resolved_model_n_jobs <= 0 or resolved_search_n_jobs <= 0:
-        raise ValueError("LGBM_MODEL_N_JOBS 和 LGBM_SEARCH_N_JOBS 必须为正整数。")
+        raise ValueError("model_n_jobs 和 search_n_jobs 必须为正整数。")
+    if resolved_smote_k_neighbors <= 0:
+        raise ValueError("smote_k_neighbors 必须为正整数。")
 
     return NotebookRunConfig(
         run_mode=resolved_run_mode,
@@ -148,6 +155,7 @@ def build_notebook_run_config(
         test_size=resolved_test_size,
         model_n_jobs=resolved_model_n_jobs,
         search_n_jobs=resolved_search_n_jobs,
+        smote_k_neighbors=resolved_smote_k_neighbors,
     )
 
 
@@ -258,7 +266,11 @@ def prepare_lightgbm_training_data(
     target_column: str = DEFAULT_TARGET_COLUMN,
     random_state: int = 42,
     test_size: float = 0.2,
+    smote_k_neighbors: int = 5,
 ) -> Dict[str, Any]:
+    if smote_k_neighbors <= 0:
+        raise ValueError("smote_k_neighbors 必须为正整数。")
+
     frame = data.copy()
     frame["RETENTION_TIME"] = pd.to_numeric(frame["RETENTION_TIME"], errors="coerce").astype("float64")
 
@@ -325,6 +337,7 @@ def prepare_lightgbm_training_data(
         X_train_processed,
         y_train,
         random_state=random_state,
+        k_neighbors=smote_k_neighbors,
     )
 
     return {
@@ -409,28 +422,3 @@ def build_lgbm_classifier(
         n_jobs=model_n_jobs,
         verbosity=-1,
     )
-
-
-def get_lgbm_search_spaces(run_mode: str):
-    from skopt.space import Categorical, Integer, Real
-
-    if run_mode == "smoke":
-        return {
-            "num_leaves": Integer(15, 63),
-            "learning_rate": Real(3e-2, 2e-1, prior="log-uniform"),
-            "n_estimators": Integer(20, 120),
-            "max_depth": Categorical([-1, 3, 5, 7]),
-            "subsample": Real(0.7, 1.0),
-            "colsample_bytree": Real(0.7, 1.0),
-            "min_child_samples": Integer(5, 30),
-        }
-
-    return {
-        "num_leaves": Integer(31, 255),
-        "learning_rate": Real(1e-2, 3e-1, prior="log-uniform"),
-        "n_estimators": Integer(200, 1000),
-        "max_depth": Categorical([-1, 3, 5, 7, 9, 12, 15]),
-        "subsample": Real(0.6, 1.0),
-        "colsample_bytree": Real(0.6, 1.0),
-        "min_child_samples": Integer(5, 50),
-    }
