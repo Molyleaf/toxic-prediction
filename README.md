@@ -2,7 +2,7 @@
 
 本项目包含两条相互独立的能力链路：
 
-- Web 推理链路：`app.py` 提供基于 Flask 的网页服务，当前使用仓库内现成的 CatBoost 推理模型。
+- Web 推理链路：`app.py` 提供基于 Flask 的网页服务，直接加载 `models/lgbm/` 下的 LightGBM 文本模型与预处理资产。
 - GPU 训练链路：`lightgbm/light_model.ipynb` 负责训练基于质谱特征的 LightGBM 二分类模型，默认使用 `device_type='gpu'`，并允许显式切回 `device_type='cuda'`。
 
 当前仓库已经将 LightGBM 训练流程统一为单一路径：
@@ -18,7 +18,7 @@
 
 ```text
 .
-├── app.py                          # Flask Web 服务，当前加载 CatBoost 推理模型
+├── app.py                          # Flask Web 服务，当前加载 LightGBM 推理资产
 ├── cuda_training_support.py        # LightGBM CUDA 训练辅助模块
 ├── lightgbm/
 │   ├── light_model.ipynb           # GPU-first 训练 notebook
@@ -259,7 +259,7 @@ cmake --build build -j4
 python app.py
 ```
 
-默认会在本地启动 Flask 服务，并使用仓库内已有的 CatBoost 推理模型。
+默认会在本地启动 Flask 服务，并使用仓库内已有的 LightGBM 推理资产。
 
 ## Docker
 
@@ -272,7 +272,7 @@ docker run -p 5000:5000 toxic-prediction
 
 ## 注意事项
 
-- 训练 notebook 与 Web 推理服务使用的模型不是同一条链路；Web 端当前仍然加载 CatBoost 产物。
+- 训练 notebook 与 Web 推理服务已对齐到同一套 `models/lgbm/` 资产；Web 端直接复用 Notebook 导出的预处理器与 LightGBM 文本模型。
 - 训练 notebook 会在启动时先做 CUDA 预检；如果当前 `lightgbm` 不是 CUDA 构建，会直接报错退出。
 - 阈值选择和概率校准都只参考训练集 OOF，不会使用测试集反向调参。
 - 如果想修改训练行为，优先改 notebook 顶部的 `NOTEBOOK_*` 全局变量，再从头重新运行整个 notebook。
