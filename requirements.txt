@@ -7,7 +7,8 @@ joblib
 scikit-learn-intelex
 openpyxl
 gunicorn
-scikit-optimize
+# 固定到已验证可在 NumPy 2.x 下工作的版本，避免旧版使用被移除的 np.float_。
+scikit-optimize==0.10.2
 matplotlib
 tqdm
 # 训练 notebook 使用 Borderline-SMOTE，需要 imbalanced-learn。
