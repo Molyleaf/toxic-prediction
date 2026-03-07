@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import platform
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -9,13 +10,17 @@ from typing import Any, Dict, Optional
 import joblib
 import numpy as np
 import pandas as pd
+from sklearn.base import BaseEstimator, ClassifierMixin
 from sklearn.model_selection import train_test_split
 from sklearn.neighbors import NearestNeighbors
 from sklearn.preprocessing import StandardScaler
+from sklearn.utils.validation import check_is_fitted
 
 
 DEFAULT_DATA_FILE = "质谱数据汇总_处理后后后2.csv"
 DEFAULT_TARGET_COLUMN = "毒性"
+RETENTION_TIME_COLUMN = "RETENTION_TIME"
+RETENTION_TIME_NUMBER_PATTERN = re.compile(r"-?(?:\d+(?:\.\d*)?|\.\d+)")
 LIGHTGBM_CUDA_PIP_INSTALL_COMMAND = (
     "pip install lightgbm --no-binary lightgbm "
     "--config-settings=cmake.define.USE_CUDA=ON"
@@ -150,6 +155,176 @@ def load_training_dataframe(
     return data.reset_index(drop=True)
 
 
+def _extract_numeric_tokens(value: Any) -> list[float]:
+    if pd.isna(value):
+        return []
+    if isinstance(value, (int, float, np.number)) and not isinstance(value, bool):
+        return [float(value)]
+
+    text = str(value).strip()
+    if not text or text.lower() in {"nan", "none", "null", "missing"}:
+        return []
+
+    return [float(token) for token in RETENTION_TIME_NUMBER_PATTERN.findall(text)]
+
+
+def clean_retention_time_series(
+    series: pd.Series,
+    aggregation: str = "mean",
+) -> tuple[pd.Series, Dict[str, Any]]:
+    if aggregation != "mean":
+        raise ValueError("当前只支持 aggregation='mean'。")
+
+    strict_numeric = pd.to_numeric(series, errors="coerce")
+    cleaned_values = []
+    multi_value_examples = []
+    multi_value_count = 0
+    original_missing_count = 0
+
+    for value in series:
+        tokens = _extract_numeric_tokens(value)
+        if not tokens:
+            cleaned_values.append(np.nan)
+            if pd.isna(value) or str(value).strip().lower() in {"", "nan", "none", "null", "missing"}:
+                original_missing_count += 1
+            continue
+
+        if len(tokens) > 1:
+            multi_value_count += 1
+            if str(value) not in multi_value_examples and len(multi_value_examples) < 5:
+                multi_value_examples.append(str(value))
+
+        cleaned_values.append(float(np.mean(tokens)))
+
+    cleaned = pd.Series(cleaned_values, index=series.index, dtype="float64", name=series.name)
+    cleaned_missing_count = int(cleaned.isna().sum())
+    strict_missing_count = int(strict_numeric.isna().sum())
+
+    diagnostics = {
+        "row_count": int(len(series)),
+        "strict_missing_count": strict_missing_count,
+        "cleaned_missing_count": cleaned_missing_count,
+        "recovered_from_text_count": int(max(strict_missing_count - cleaned_missing_count, 0)),
+        "original_missing_count": int(original_missing_count),
+        "multi_value_count": int(multi_value_count),
+        "multi_value_examples": multi_value_examples,
+        "aggregation": aggregation,
+    }
+    diagnostics["unparsed_non_missing_count"] = int(
+        max(cleaned_missing_count - diagnostics["original_missing_count"], 0)
+    )
+
+    return cleaned, diagnostics
+
+
+def _fit_lightgbm_preprocessor(X: pd.DataFrame) -> Dict[str, Any]:
+    X_df = X.copy() if isinstance(X, pd.DataFrame) else pd.DataFrame(X)
+
+    retention_time_diagnostics = None
+    if RETENTION_TIME_COLUMN in X_df.columns:
+        cleaned_retention_time, retention_time_diagnostics = clean_retention_time_series(
+            X_df[RETENTION_TIME_COLUMN]
+        )
+        X_df.loc[:, RETENTION_TIME_COLUMN] = cleaned_retention_time
+
+    raw_feature_columns = X_df.columns.tolist()
+    numeric_features = X_df.select_dtypes(include=["number"]).columns.tolist()
+    categorical_features = X_df.select_dtypes(exclude=["number"]).columns.tolist()
+
+    numeric_fill_values = {}
+    for column in numeric_features:
+        mode = X_df[column].mode(dropna=True)
+        numeric_fill_values[column] = mode.iloc[0] if not mode.empty else 0
+
+    categorical_fill_values = {}
+    for column in categorical_features:
+        mode = X_df[column].mode(dropna=True)
+        categorical_fill_values[column] = mode.iloc[0] if not mode.empty else "missing"
+
+    continuous_features = numeric_features.copy()
+    discrete_features = categorical_features.copy()
+
+    scaler = None
+    if continuous_features:
+        scaler = StandardScaler()
+        filled_continuous = X_df[continuous_features].copy()
+        for column in continuous_features:
+            filled_continuous.loc[:, column] = pd.to_numeric(
+                filled_continuous[column],
+                errors="coerce",
+            ).astype("float64")
+        filled_continuous = filled_continuous.fillna(numeric_fill_values)
+        scaler.fit(filled_continuous)
+
+    return {
+        "raw_feature_columns": raw_feature_columns,
+        "model_feature_columns": continuous_features + discrete_features,
+        "continuous_features": continuous_features,
+        "discrete_features": discrete_features,
+        "numeric_fill_values": numeric_fill_values,
+        "categorical_fill_values": categorical_fill_values,
+        "scaler": scaler,
+        "retention_time_column": RETENTION_TIME_COLUMN if RETENTION_TIME_COLUMN in X_df.columns else None,
+        "retention_time_multi_value_strategy": "mean",
+        "retention_time_diagnostics": retention_time_diagnostics,
+    }
+
+
+def transform_lightgbm_features(
+    X: pd.DataFrame,
+    preprocessor: Dict[str, Any],
+) -> pd.DataFrame:
+    X_df = X.copy() if isinstance(X, pd.DataFrame) else pd.DataFrame(X)
+    raw_feature_columns = preprocessor["raw_feature_columns"]
+    missing_columns = [column for column in raw_feature_columns if column not in X_df.columns]
+    if missing_columns:
+        raise ValueError(f"输入数据缺少训练时使用的特征列: {missing_columns}")
+
+    X_aligned = X_df.loc[:, raw_feature_columns].copy()
+
+    retention_time_column = preprocessor.get("retention_time_column")
+    if retention_time_column and retention_time_column in X_aligned.columns:
+        cleaned_retention_time, _ = clean_retention_time_series(X_aligned[retention_time_column])
+        X_aligned.loc[:, retention_time_column] = cleaned_retention_time
+
+    continuous_features = preprocessor["continuous_features"]
+    discrete_features = preprocessor["discrete_features"]
+
+    if continuous_features:
+        for column in continuous_features:
+            X_aligned.loc[:, column] = pd.to_numeric(
+                X_aligned[column],
+                errors="coerce",
+            ).astype("float64")
+        X_aligned.loc[:, continuous_features] = X_aligned[continuous_features].fillna(
+            preprocessor["numeric_fill_values"]
+        )
+
+    if discrete_features:
+        X_aligned.loc[:, discrete_features] = X_aligned[discrete_features].fillna(
+            preprocessor["categorical_fill_values"]
+        )
+
+    processed = pd.DataFrame(index=X_aligned.index)
+    if continuous_features:
+        scaler = preprocessor["scaler"]
+        scaled_values = scaler.transform(X_aligned[continuous_features])
+        processed = pd.DataFrame(
+            scaled_values,
+            columns=continuous_features,
+            index=X_aligned.index,
+        )
+
+    if discrete_features:
+        processed = pd.concat([processed, X_aligned[discrete_features]], axis=1)
+
+    processed = processed.loc[:, preprocessor["model_feature_columns"]]
+    if processed.isna().any().any():
+        raise ValueError("预处理后仍存在缺失值，无法继续执行 SMOTE 和模型训练。")
+
+    return processed.reset_index(drop=True)
+
+
 def notebook_smote_resample(
     X: pd.DataFrame,
     y: pd.Series,
@@ -230,6 +405,131 @@ def notebook_smote_resample(
     return X_resampled, y_resampled
 
 
+class FoldSafeSmoteLGBMClassifier(BaseEstimator, ClassifierMixin):
+    """
+    LightGBM 二分类封装器。
+
+    作用：
+    - 在每个 `fit` 调用内部重新学习缺失值填充值与标准化器，避免 CV 泄漏。
+    - 仅在当前训练数据上执行 SMOTE，保证每个交叉验证训练折独立过采样。
+    - 统一清洗 `RETENTION_TIME`，把类似 `17.9 and 18.5` 的多值文本解析为均值。
+
+    关键超参数：
+    - `random_state`: 统一控制数据处理、SMOTE 与 LightGBM 的随机性。
+    - `device_type`: 训练设备，项目强制限定为 `cuda`。
+    - `model_n_jobs`: LightGBM 单模型内部线程数。
+    - `smote_k_neighbors`: 折内 SMOTE 的近邻数。
+    - `num_leaves`: 单棵树的最大叶子数，越大越容易拟合复杂模式。
+    - `learning_rate`: 每轮 boosting 的步长，越小通常越稳。
+    - `n_estimators`: boosting 轮数，通常与 `learning_rate` 联动。
+    - `max_depth`: 树深上限，用于限制树结构复杂度。
+    - `subsample`: 行采样比例，降低同一批样本反复参与建树的风险。
+    - `colsample_bytree`: 列采样比例，降低特征共适应。
+    - `min_child_samples`: 叶子最少样本数，提高分裂保守性。
+    - `min_split_gain`: 节点继续分裂所需的最小增益。
+    - `reg_alpha`: L1 正则强度，鼓励更稀疏的分裂模式。
+    - `reg_lambda`: L2 正则强度，抑制权重过大。
+    """
+
+    def __init__(
+        self,
+        random_state: int = 42,
+        device_type: str = "cuda",
+        model_n_jobs: int = 1,
+        smote_k_neighbors: int = 5,
+        num_leaves: int = 31,
+        learning_rate: float = 0.05,
+        n_estimators: int = 100,
+        max_depth: int = -1,
+        subsample: float = 1.0,
+        colsample_bytree: float = 1.0,
+        min_child_samples: int = 20,
+        min_split_gain: float = 0.0,
+        reg_alpha: float = 0.0,
+        reg_lambda: float = 0.0,
+    ):
+        self.random_state = random_state
+        self.device_type = device_type
+        self.model_n_jobs = model_n_jobs
+        self.smote_k_neighbors = smote_k_neighbors
+        self.num_leaves = num_leaves
+        self.learning_rate = learning_rate
+        self.n_estimators = n_estimators
+        self.max_depth = max_depth
+        self.subsample = subsample
+        self.colsample_bytree = colsample_bytree
+        self.min_child_samples = min_child_samples
+        self.min_split_gain = min_split_gain
+        self.reg_alpha = reg_alpha
+        self.reg_lambda = reg_lambda
+
+    def _build_model(self):
+        validate_cuda_only_requested(self.device_type)
+
+        import lightgbm as lgb
+
+        return lgb.LGBMClassifier(
+            objective="binary",
+            device_type="cuda",
+            random_state=self.random_state,
+            n_jobs=self.model_n_jobs,
+            subsample_freq=1,
+            num_leaves=self.num_leaves,
+            learning_rate=self.learning_rate,
+            n_estimators=self.n_estimators,
+            max_depth=self.max_depth,
+            subsample=self.subsample,
+            colsample_bytree=self.colsample_bytree,
+            min_child_samples=self.min_child_samples,
+            min_split_gain=self.min_split_gain,
+            reg_alpha=self.reg_alpha,
+            reg_lambda=self.reg_lambda,
+            verbosity=-1,
+        )
+
+    def fit(self, X: pd.DataFrame, y: pd.Series):
+        if self.smote_k_neighbors <= 0:
+            raise ValueError("smote_k_neighbors 必须为正整数。")
+
+        X_df = X.copy() if isinstance(X, pd.DataFrame) else pd.DataFrame(X)
+        y_series = y.copy() if isinstance(y, pd.Series) else pd.Series(y, name="target")
+        y_series = y_series.reset_index(drop=True)
+        X_df = X_df.reset_index(drop=True)
+
+        self.preprocessor_bundle_ = _fit_lightgbm_preprocessor(X_df)
+        X_processed = transform_lightgbm_features(X_df, self.preprocessor_bundle_)
+        self.fit_class_counts_ = y_series.value_counts().sort_index().to_dict()
+
+        X_resampled, y_resampled = notebook_smote_resample(
+            X_processed,
+            y_series,
+            random_state=self.random_state,
+            k_neighbors=self.smote_k_neighbors,
+        )
+        self.resampled_class_counts_ = y_resampled.value_counts().sort_index().to_dict()
+
+        self.model_ = self._build_model()
+        self.model_.fit(X_resampled, y_resampled)
+        self.classes_ = getattr(self.model_, "classes_", np.sort(y_series.unique()))
+        self.booster_ = self.model_.booster_
+
+        return self
+
+    def predict(self, X: pd.DataFrame):
+        check_is_fitted(self, "model_")
+        X_processed = transform_lightgbm_features(X, self.preprocessor_bundle_)
+        return self.model_.predict(X_processed)
+
+    def predict_proba(self, X: pd.DataFrame):
+        check_is_fitted(self, "model_")
+        X_processed = transform_lightgbm_features(X, self.preprocessor_bundle_)
+        return self.model_.predict_proba(X_processed)
+
+    def get_preprocessor_bundle(self) -> Dict[str, Any]:
+        check_is_fitted(self, "preprocessor_bundle_")
+        return self.preprocessor_bundle_
+
+
 def prepare_lightgbm_training_data(
     data: pd.DataFrame,
     target_column: str = DEFAULT_TARGET_COLUMN,
@@ -241,7 +541,12 @@ def prepare_lightgbm_training_data(
         raise ValueError("smote_k_neighbors 必须为正整数。")
 
     frame = data.copy()
-    frame["RETENTION_TIME"] = pd.to_numeric(frame["RETENTION_TIME"], errors="coerce").astype("float64")
+    retention_time_diagnostics = None
+    if RETENTION_TIME_COLUMN in frame.columns:
+        cleaned_retention_time, retention_time_diagnostics = clean_retention_time_series(
+            frame[RETENTION_TIME_COLUMN]
+        )
+        frame.loc[:, RETENTION_TIME_COLUMN] = cleaned_retention_time
 
     X = frame.drop([target_column], axis=1)
     y = frame[target_column]
@@ -254,74 +559,14 @@ def prepare_lightgbm_training_data(
         stratify=y,
     )
 
-    numeric_features = X_train.select_dtypes(include=["number"]).columns.tolist()
-    categorical_features = X_train.select_dtypes(exclude=["number"]).columns.tolist()
-
-    numeric_fill_values = {}
-    for column in numeric_features:
-        mode = X_train[column].mode(dropna=True)
-        numeric_fill_values[column] = mode.iloc[0] if not mode.empty else 0
-
-    categorical_fill_values = {}
-    for column in categorical_features:
-        mode = X_train[column].mode(dropna=True)
-        categorical_fill_values[column] = mode.iloc[0] if not mode.empty else "missing"
-
-    if numeric_features:
-        X_train.loc[:, numeric_features] = X_train[numeric_features].fillna(numeric_fill_values)
-        X_test.loc[:, numeric_features] = X_test[numeric_features].fillna(numeric_fill_values)
-
-    if categorical_features:
-        X_train.loc[:, categorical_features] = X_train[categorical_features].fillna(categorical_fill_values)
-        X_test.loc[:, categorical_features] = X_test[categorical_features].fillna(categorical_fill_values)
-
-    continuous_features = X_train.select_dtypes(include=["number"]).columns.tolist()
-    discrete_features = X_train.select_dtypes(exclude=["number"]).columns.tolist()
-
-    scaler = StandardScaler()
-    if continuous_features:
-        X_train_continuous = scaler.fit_transform(X_train[continuous_features])
-        X_test_continuous = scaler.transform(X_test[continuous_features])
-        X_train_processed = pd.DataFrame(
-            X_train_continuous,
-            columns=continuous_features,
-            index=X_train.index,
-        )
-        X_test_processed = pd.DataFrame(
-            X_test_continuous,
-            columns=continuous_features,
-            index=X_test.index,
-        )
-    else:
-        X_train_processed = pd.DataFrame(index=X_train.index)
-        X_test_processed = pd.DataFrame(index=X_test.index)
-
-    if discrete_features:
-        X_train_processed = pd.concat([X_train_processed, X_train[discrete_features]], axis=1)
-        X_test_processed = pd.concat([X_test_processed, X_test[discrete_features]], axis=1)
-
-    if X_train_processed.isna().any().any() or X_test_processed.isna().any().any():
-        raise ValueError("预处理后仍存在缺失值，无法继续执行 SMOTE 和模型训练。")
-
-    X_train_resampled, y_train_resampled = notebook_smote_resample(
-        X_train_processed,
-        y_train,
-        random_state=random_state,
-        k_neighbors=smote_k_neighbors,
-    )
-
     return {
-        "X_train": X_train_resampled,
-        "X_test": X_test_processed,
-        "y_train": y_train_resampled,
+        "X_train": X_train.reset_index(drop=True),
+        "X_test": X_test.reset_index(drop=True),
+        "y_train": y_train.reset_index(drop=True),
         "y_test": y_test.reset_index(drop=True),
         "raw_feature_columns": X.columns.tolist(),
-        "model_feature_columns": X_test_processed.columns.tolist(),
-        "scaler": scaler,
-        "continuous_features": continuous_features,
-        "discrete_features": discrete_features,
-        "numeric_fill_values": numeric_fill_values,
-        "categorical_fill_values": categorical_fill_values,
+        "retention_time_diagnostics": retention_time_diagnostics,
+        "smote_k_neighbors": smote_k_neighbors,
     }
 
 
@@ -382,21 +627,13 @@ def build_lgbm_classifier(
     random_state: int = 42,
     device_type: str = "cuda",
     model_n_jobs: int = 1,
+    smote_k_neighbors: int = 5,
 ):
-    validate_cuda_only_requested(device_type)
-
-    import lightgbm as lgb
-
-    return lgb.LGBMClassifier(
-        objective="binary",
-        device_type="cuda",
+    return FoldSafeSmoteLGBMClassifier(
         random_state=random_state,
-        n_jobs=model_n_jobs,
-        subsample_freq=1,
-        reg_alpha=0.1,
-        reg_lambda=5.0,
-        min_split_gain=0.05,
-        verbosity=-1,
+        device_type=device_type,
+        model_n_jobs=model_n_jobs,
+        smote_k_neighbors=smote_k_neighbors,
     )
 
 
@@ -436,16 +673,44 @@ def save_lightgbm_inference_artifacts(
 
     estimator.booster_.save_model(str(model_path))
 
+    estimator_preprocessor = (
+        estimator.get_preprocessor_bundle()
+        if hasattr(estimator, "get_preprocessor_bundle")
+        else {}
+    )
     preprocessor_bundle = {
         "artifacts_version": 1,
         "target_column": target_column,
-        "raw_feature_columns": prepared["raw_feature_columns"],
-        "model_feature_columns": prepared["model_feature_columns"],
-        "continuous_features": prepared["continuous_features"],
-        "discrete_features": prepared["discrete_features"],
-        "numeric_fill_values": prepared["numeric_fill_values"],
-        "categorical_fill_values": prepared["categorical_fill_values"],
-        "scaler": prepared["scaler"],
+        "raw_feature_columns": estimator_preprocessor.get(
+            "raw_feature_columns",
+            prepared.get("raw_feature_columns", []),
+        ),
+        "model_feature_columns": estimator_preprocessor.get(
+            "model_feature_columns",
+            prepared.get("model_feature_columns", []),
+        ),
+        "continuous_features": estimator_preprocessor.get(
+            "continuous_features",
+            prepared.get("continuous_features", []),
+        ),
+        "discrete_features": estimator_preprocessor.get(
+            "discrete_features",
+            prepared.get("discrete_features", []),
+        ),
+        "numeric_fill_values": estimator_preprocessor.get(
+            "numeric_fill_values",
+            prepared.get("numeric_fill_values", {}),
+        ),
+        "categorical_fill_values": estimator_preprocessor.get(
+            "categorical_fill_values",
+            prepared.get("categorical_fill_values", {}),
+        ),
+        "scaler": estimator_preprocessor.get("scaler", prepared.get("scaler")),
+        "retention_time_column": estimator_preprocessor.get("retention_time_column"),
+        "retention_time_multi_value_strategy": estimator_preprocessor.get(
+            "retention_time_multi_value_strategy"
+        ),
+        "retention_time_diagnostics": estimator_preprocessor.get("retention_time_diagnostics"),
         "classes_": list(getattr(estimator, "classes_", [])),
         "classification_threshold": classification_threshold,
     }
@@ -457,12 +722,18 @@ def save_lightgbm_inference_artifacts(
         "preprocessor_path": preprocessor_path,
         "target_column": target_column,
         "data_path": data_path,
-        "raw_feature_columns": prepared["raw_feature_columns"],
-        "model_feature_columns": prepared["model_feature_columns"],
-        "continuous_features": prepared["continuous_features"],
-        "discrete_features": prepared["discrete_features"],
-        "numeric_fill_values": prepared["numeric_fill_values"],
-        "categorical_fill_values": prepared["categorical_fill_values"],
+        "raw_feature_columns": preprocessor_bundle["raw_feature_columns"],
+        "model_feature_columns": preprocessor_bundle["model_feature_columns"],
+        "continuous_features": preprocessor_bundle["continuous_features"],
+        "discrete_features": preprocessor_bundle["discrete_features"],
+        "numeric_fill_values": preprocessor_bundle["numeric_fill_values"],
+        "categorical_fill_values": preprocessor_bundle["categorical_fill_values"],
+        "retention_time_column": preprocessor_bundle["retention_time_column"],
+        "retention_time_multi_value_strategy": preprocessor_bundle[
+            "retention_time_multi_value_strategy"
+        ],
+        "retention_time_diagnostics": preprocessor_bundle["retention_time_diagnostics"],
+        "dataset_retention_time_diagnostics": prepared.get("retention_time_diagnostics"),
         "classes_": list(getattr(estimator, "classes_", [])),
         "classification_threshold": classification_threshold,
         "random_seed": random_seed,

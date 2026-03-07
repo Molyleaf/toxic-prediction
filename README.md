@@ -14,7 +14,9 @@ The core of this project is a mass-spectrometry-based toxicity classifier. The r
 * **Genotoxicity Prediction**: Predicts substance genotoxicity based on mass spectrometry data.
 * **Pre-trained Model**: Includes a ready-to-use model trained on the Massbank dataset.
 * **CUDA-only Training Notebook**: LightGBM training is pinned to `device_type='cuda'` and performs a preflight check before any real training starts.
+* **Leak-free CV Pipeline**: missing-value filling, scaling, and SMOTE are learned inside each cross-validation training fold instead of before BayesSearchCV.
 * **Notebook-first Training Flow**: the notebook is organized into config/imports, pre-training diagnostics, and a single training-and-save block.
+* **Robust `RETENTION_TIME` Cleaning**: multi-value text such as `17.9 and 18.5` is parsed into a single numeric value instead of being dropped as `NaN`.
 * **Notebook Progress Bar**: BayesSearchCV progress is shown in the notebook through `tqdm.auto`.
 * **Native LightGBM Export**: the best trained booster is saved to `models/lightgbm_cuda_model.txt`.
 * **Inference Artifact Bundle**: preprocessing state is saved alongside the model in `models/lightgbm_cuda_preprocessor.joblib` and `models/lightgbm_cuda_inference_assets.json`.
@@ -115,33 +117,61 @@ Key behavior:
 
 * Training is locked to `cuda`.
 * CPU fallback is disabled on purpose.
-* The first code cell centralizes imports, path fixes, `NOTEBOOK_*` globals, and the output paths for all inference artifacts.
+* The first code cell centralizes imports, path fixes, `NOTEBOOK_*` globals, the commented LightGBM search space, and the output paths for all inference artifacts.
 * `NOTEBOOK_CONFIG` is built from those globals, so edit that first cell and rerun the notebook from the top when you want to change training behavior.
-* The second code cell runs data loading, preprocessing, and consolidated diagnostics before any fitting starts.
+* The second code cell runs data loading, `RETENTION_TIME` cleaning diagnostics, and train/test splitting before any fitting starts.
 * The third code cell runs the only BayesSearchCV training pass, shows a `tqdm.auto` progress bar, evaluates the best estimator, and saves the full inference artifact bundle.
+* Missing-value filling, scaling, and SMOTE happen inside the estimator `fit`, so each CV training fold learns its own preprocessing state and performs its own SMOTE pass.
 
 Main globals in the first notebook cell:
 
 ```python
+# NOTEBOOK_RANDOM_SEED: controls the random seed for the split, BayesSearchCV, SMOTE, and LightGBM.
 NOTEBOOK_RANDOM_SEED = 114514
+# NOTEBOOK_TEST_SIZE: fraction reserved for the final hold-out test set.
 NOTEBOOK_TEST_SIZE = 0.25
+# NOTEBOOK_BAYES_N_ITER: number of candidate parameter sets sampled by BayesSearchCV.
 NOTEBOOK_BAYES_N_ITER = 24
+# NOTEBOOK_CV_FOLDS: number of stratified cross-validation folds.
 NOTEBOOK_CV_FOLDS = 5
+# NOTEBOOK_MODEL_N_JOBS: thread count used inside a single LightGBM fit.
 NOTEBOOK_MODEL_N_JOBS = 1
+# NOTEBOOK_SEARCH_N_JOBS: BayesSearchCV worker count; `1` is safer for a shared GPU.
 NOTEBOOK_SEARCH_N_JOBS = 1
+# NOTEBOOK_SMOTE_K_NEIGHBORS: nearest-neighbor count used by fold-local SMOTE.
 NOTEBOOK_SMOTE_K_NEIGHBORS = 5
+# NOTEBOOK_BAYES_SCORING: model-selection metric used by BayesSearchCV.
 NOTEBOOK_BAYES_SCORING = "roc_auc"
+# NOTEBOOK_BAYES_VERBOSE: BayesSearchCV verbosity level.
 NOTEBOOK_BAYES_VERBOSE = 0
 ```
 
-The same top cell also defines `NOTEBOOK_LGBM_SEARCH_SPACES` so the LightGBM search space is centralized with the rest of the notebook hyperparameters.
+The same top cell also defines `NOTEBOOK_LGBM_SEARCH_SPACES`, with every search dimension annotated in-place:
+
+```python
+NOTEBOOK_LGBM_SEARCH_SPACES = {
+    "num_leaves": Integer(8, 31),  # max leaves per tree; smaller is more conservative.
+    "learning_rate": Real(3e-3, 8e-3, prior="log-uniform"),  # boosting step size.
+    "n_estimators": Integer(500, 1800),  # number of boosting rounds.
+    "max_depth": Categorical([3, 4, 5, 6]),  # hard tree depth cap.
+    "subsample": Real(0.6, 0.85),  # row sampling ratio per tree.
+    "colsample_bytree": Real(0.6, 0.85),  # feature sampling ratio per tree.
+    "min_child_samples": Integer(50, 200),  # minimum samples required in a leaf.
+    "min_split_gain": Real(1e-2, 0.3, prior="log-uniform"),  # minimum gain required to split.
+    "reg_alpha": Real(0.1, 10.0, prior="log-uniform"),  # L1 regularization strength.
+    "reg_lambda": Real(5.0, 50.0, prior="log-uniform"),  # L2 regularization strength.
+}
+```
+
+`RETENTION_TIME` handling is also centralized: plain numeric values stay unchanged, multi-value text rows are reduced to the mean of all numeric tokens, and truly missing values remain missing until they are imputed with the training-fold mode.
 
 The notebook training flow covers:
 
 * CSV loading
-* feature preprocessing
+* `RETENTION_TIME` normalization and diagnostics
 * training diagnostics before fitting
-* notebook-local SMOTE replacement
+* fold-local preprocessing learned independently inside every CV training fold
+* fold-local SMOTE replacement applied only to the current training fold
 * CUDA preflight for LightGBM
 * a full BayesSearchCV training loop with stronger regularization to reduce overfitting
 * notebook progress tracking through `tqdm.auto`
@@ -152,7 +182,7 @@ The notebook training flow covers:
 The downstream inference bundle consists of:
 
 * `models/lightgbm_cuda_model.txt`: native LightGBM booster
-* `models/lightgbm_cuda_preprocessor.joblib`: fitted scaler, fill values, feature grouping, and feature order
+* `models/lightgbm_cuda_preprocessor.joblib`: fitted scaler, fill values, feature grouping, feature order, and `RETENTION_TIME` cleaning metadata
 * `models/lightgbm_cuda_inference_assets.json`: human-readable manifest of the saved inference assets
 
 If the installed `lightgbm` package was not compiled with CUDA support, the notebook will fail fast with an explicit error instead of silently falling back to CPU.
