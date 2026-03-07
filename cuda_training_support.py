@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import platform
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -14,6 +15,16 @@ from sklearn.preprocessing import StandardScaler
 
 DEFAULT_DATA_FILE = "质谱数据汇总_处理后后后2.csv"
 DEFAULT_TARGET_COLUMN = "毒性"
+LIGHTGBM_CUDA_PIP_INSTALL_COMMAND = (
+    "pip install lightgbm --no-binary lightgbm "
+    "--config-settings=cmake.define.USE_CUDA=ON"
+)
+LIGHTGBM_CUDA_SOURCE_BUILD_COMMANDS = (
+    "git clone --recursive https://github.com/microsoft/LightGBM\n"
+    "cd LightGBM\n"
+    "cmake -B build -S . -DUSE_CUDA=ON\n"
+    "cmake --build build -j4"
+)
 
 
 @dataclass(frozen=True)
@@ -26,6 +37,50 @@ class NotebookRunConfig:
     test_size: float
     model_n_jobs: int
     search_n_jobs: int
+
+
+def format_notebook_run_summary(
+    config: NotebookRunConfig,
+    data_path: Optional[Path] = None,
+) -> str:
+    lines = [
+        f"训练模式: {config.run_mode}",
+        f"随机种子: {config.random_seed}",
+        f"测试集比例: {config.test_size}",
+        f"Smoke sample size: {config.sample_size}",
+        f"BayesSearch n_iter: {config.bayes_n_iter}",
+        f"CV folds: {config.cv_folds}",
+        f"模型 n_jobs: {config.model_n_jobs}",
+        f"搜索 n_jobs: {config.search_n_jobs}",
+    ]
+    if data_path is not None:
+        lines.insert(1, f"数据文件: {data_path}")
+    return "\n".join(lines)
+
+
+def get_lightgbm_cuda_installation_notes() -> str:
+    system_name = platform.system()
+    lines = []
+
+    if system_name == "Windows":
+        lines.append("检测到当前系统为 Windows。官方当前不支持 Windows 上的 CUDA 版 LightGBM。")
+        lines.append("如果要继续使用 device_type='cuda'，请改到 Linux 或 WSL2 训练。")
+    elif system_name == "Linux":
+        lines.append("检测到当前系统为 Linux。请确认 NVIDIA CUDA 环境已可用，再继续安装 LightGBM。")
+    else:
+        lines.append(f"检测到当前系统为 {system_name}。官方仅支持在 Linux 上使用 LightGBM 的 CUDA 版本。")
+
+    lines.extend(
+        [
+            "",
+            "Python 包源码安装命令:",
+            f"  {LIGHTGBM_CUDA_PIP_INSTALL_COMMAND}",
+            "",
+            "如需先手工编译 LightGBM，可使用:",
+            LIGHTGBM_CUDA_SOURCE_BUILD_COMMANDS,
+        ]
+    )
+    return "\n".join(lines)
 
 
 def resolve_data_path(
@@ -327,9 +382,12 @@ def validate_lightgbm_cuda_build(
         probe.fit(X_probe, y_probe)
         probe.predict_proba(X_probe)
     except Exception as exc:  # pragma: no cover - runtime environment dependent
+        lgbm_version = getattr(lgb, "__version__", "unknown")
         raise RuntimeError(
-            "当前 LightGBM 不能以 CUDA 模式训练。项目已禁用任何静默 fallback；"
-            "请安装或编译启用 USE_CUDA=1 的 LightGBM 后重试。"
+            "当前 LightGBM 不能以 CUDA 模式训练。\n"
+            f"已检测到 lightgbm=={lgbm_version}，但它不是启用 USE_CUDA=1 的构建。\n"
+            "项目已禁用任何静默 fallback。\n"
+            f"{get_lightgbm_cuda_installation_notes()}"
         ) from exc
 
     return getattr(lgb, "__version__", "unknown")

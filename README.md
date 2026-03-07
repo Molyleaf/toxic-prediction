@@ -70,6 +70,33 @@ pip install -r requirements.txt
 
 For the training notebook, `lightgbm` must be a **CUDA-enabled** build. A CPU-only build is intentionally rejected during preflight and will stop the notebook / smoke script immediately.
 
+### Installing CUDA LightGBM on Linux
+
+The notebook uses `device_type='cuda'`, which means the plain Windows wheel is not sufficient. Keep the web app on Windows if you want, but move the training notebook to Linux or WSL2 and reinstall LightGBM from source with CUDA enabled.
+
+Recommended Python package install:
+
+```bash
+pip uninstall -y lightgbm
+pip install lightgbm --no-binary lightgbm --config-settings=cmake.define.USE_CUDA=ON
+```
+
+If you prefer compiling LightGBM first:
+
+```bash
+git clone --recursive https://github.com/microsoft/LightGBM
+cd LightGBM
+cmake -B build -S . -DUSE_CUDA=ON
+cmake --build build -j4
+```
+
+Prerequisites from the official LightGBM installation guide:
+
+* Linux
+* CMake 3.28 or newer
+* GCC or Clang
+* CUDA Toolkit 11.0 or newer
+
 **d. Run the application**
 
 ```bash
@@ -87,6 +114,7 @@ Key behavior:
 * Training is locked to `cuda`.
 * CPU fallback is disabled on purpose.
 * The notebook defaults to a **smoke** configuration so you can validate the pipeline without launching a full search.
+* `NOTEBOOK_CONFIG` is built from environment variables, so switch modes before launching the kernel.
 
 Useful environment variables:
 
@@ -95,6 +123,10 @@ LGBM_NOTEBOOK_RUN_MODE=smoke   # or full
 LGBM_SMOKE_SAMPLE_SIZE=1024
 LGBM_BAYES_N_ITER=2
 LGBM_CV_FOLDS=2
+LGBM_RANDOM_SEED=42
+LGBM_TEST_SIZE=0.2
+LGBM_MODEL_N_JOBS=1
+LGBM_SEARCH_N_JOBS=1
 ```
 
 Before running the full notebook, use the reduced-scope smoke test:
