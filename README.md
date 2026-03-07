@@ -113,20 +113,26 @@ Key behavior:
 * Training is locked to `cuda`.
 * CPU fallback is disabled on purpose.
 * The notebook starts with a **smoke validation** block so you can validate the pipeline without launching a second entrypoint.
-* `NOTEBOOK_CONFIG` is built from environment variables, so switch modes before launching the kernel.
+* All notebook hyperparameters are defined in the first code cell as `NOTEBOOK_*` globals.
+* `NOTEBOOK_CONFIG` is built from those globals, so edit that first cell and rerun the notebook from the top when you want to change training behavior.
 
-Useful environment variables:
+Main globals in the first notebook cell:
 
-```bash
-LGBM_NOTEBOOK_RUN_MODE=smoke   # or full
-LGBM_SMOKE_SAMPLE_SIZE=1024
-LGBM_BAYES_N_ITER=2
-LGBM_CV_FOLDS=2
-LGBM_RANDOM_SEED=42
-LGBM_TEST_SIZE=0.2
-LGBM_MODEL_N_JOBS=1
-LGBM_SEARCH_N_JOBS=1
+```python
+NOTEBOOK_RUN_MODE = "smoke"  # or "full"
+NOTEBOOK_SAMPLE_SIZE = 1024 if NOTEBOOK_RUN_MODE == "smoke" else 0
+NOTEBOOK_BAYES_N_ITER = 2 if NOTEBOOK_RUN_MODE == "smoke" else 32
+NOTEBOOK_CV_FOLDS = 2 if NOTEBOOK_RUN_MODE == "smoke" else 5
+NOTEBOOK_RANDOM_SEED = 42
+NOTEBOOK_TEST_SIZE = 0.2
+NOTEBOOK_MODEL_N_JOBS = 1
+NOTEBOOK_SEARCH_N_JOBS = 1
+NOTEBOOK_SMOTE_K_NEIGHBORS = 5
+NOTEBOOK_BAYES_SCORING = "roc_auc"
+NOTEBOOK_BAYES_VERBOSE = 1
 ```
+
+The same top cell also defines `NOTEBOOK_SMOKE_SEARCH_SPACES`, `NOTEBOOK_FULL_SEARCH_SPACES`, and `NOTEBOOK_LGBM_SEARCH_SPACES` so the LightGBM search space is centralized with the rest of the notebook hyperparameters.
 
 The first notebook section performs the reduced-scope smoke validation. It covers:
 
