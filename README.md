@@ -3,7 +3,7 @@
 本项目包含两条相互独立的能力链路：
 
 - Web 推理链路：`app.py` 提供基于 Flask 的网页服务，当前使用仓库内现成的 CatBoost 推理模型。
-- CUDA 训练链路：`lightgbm/light_model.ipynb` 负责训练基于质谱特征的 LightGBM 二分类模型，并强制使用 `device_type='cuda'`。
+- GPU 训练链路：`lightgbm/light_model.ipynb` 负责训练基于质谱特征的 LightGBM 二分类模型，默认使用 `device_type='gpu'`，并允许显式切回 `device_type='cuda'`。
 
 当前仓库已经将 LightGBM 训练流程统一为单一路径：
 
@@ -21,7 +21,7 @@
 ├── app.py                          # Flask Web 服务，当前加载 CatBoost 推理模型
 ├── cuda_training_support.py        # LightGBM CUDA 训练辅助模块
 ├── lightgbm/
-│   ├── light_model.ipynb           # CUDA-only 训练 notebook
+│   ├── light_model.ipynb           # GPU-first 训练 notebook
 │   └── 质谱数据汇总_处理后后后2.csv   # 训练数据
 ├── models/                         # 已保存的推理模型与训练输出
 ├── static/                         # 前端静态资源
@@ -116,7 +116,7 @@ NOTEBOOK_LGBM_SEARCH_SPACES = {
 
 ### 4. RTX 4090 训练利用率
 
-LightGBM 的 CUDA 训练并不是只有 GPU 在工作，CPU 仍然负责一部分直方图构建、数据调度和喂数。
+LightGBM 的 GPU / CUDA 训练并不是只有 GPU 在工作，CPU 仍然负责一部分直方图构建、数据调度和喂数。
 
 当前默认策略：
 
@@ -143,6 +143,7 @@ LightGBM 的 CUDA 训练并不是只有 GPU 在工作，CPU 仍然负责一部�
 ### Notebook 顶部关键参数
 
 ```python
+NOTEBOOK_DEVICE_TYPE = "gpu"
 NOTEBOOK_RANDOM_SEED = 114514
 NOTEBOOK_TEST_SIZE = 0.15
 NOTEBOOK_BAYES_N_ITER = 48
@@ -169,6 +170,8 @@ NOTEBOOK_CALIBRATION_METHOD = "isotonic"
   - 预处理器、`RETENTION_TIME` 清洗信息、概率校准器、阈值元数据、重采样信息
 - `models/lightgbm_cuda_inference_assets.json`
   - 适合人工查看的清单文件，记录模型路径、阈值、概率校准信息、重采样信息与训练配置
+
+虽然默认训练设备已切到 `gpu`（OpenCL），当前 notebook 仍沿用历史输出文件名 `lightgbm_cuda_*`，避免影响现有资产引用路径。
 
 ## 环境安装
 
@@ -213,17 +216,17 @@ ValueError: numpy.dtype size changed, may indicate binary incompatibility
 
 这时不要只重装 `pandas`，而是按上面的命令把整套科学计算依赖一起重装。
 
-### 2. 安装 CUDA 版 LightGBM
+### 2. 安装 GPU 版 LightGBM
 
-项目训练链路固定要求 `device_type='cuda'`，不会静默回退到 CPU。
+项目训练链路固定要求加速设备为 `gpu` 或 `cuda`，不会静默回退到 CPU。
 
-如果你在 Windows 上开发 Web 服务，建议把训练 notebook 放到 Linux 或 WSL2 环境执行。
+当前 notebook 默认先尝试 `device_type='gpu'`。如果你确认当前 CUDA 路径稳定，也可以把 `NOTEBOOK_DEVICE_TYPE` 显式改回 `cuda`。
 
 推荐安装方式：
 
 ```bash
 pip uninstall -y lightgbm
-pip install lightgbm --no-binary lightgbm --config-settings=cmake.define.USE_CUDA=ON
+pip install lightgbm --no-binary lightgbm --config-settings=cmake.define.USE_GPU=ON
 ```
 
 如果需要先编译源码：
@@ -231,11 +234,17 @@ pip install lightgbm --no-binary lightgbm --config-settings=cmake.define.USE_CUD
 ```bash
 git clone --recursive https://github.com/microsoft/LightGBM
 cd LightGBM
-cmake -B build -S . -DUSE_CUDA=ON
+cmake -B build -S . -DUSE_GPU=ON
 cmake --build build -j4
 ```
 
-至少需要：
+默认 `gpu` 路径至少需要：
+
+- Windows 或 Linux 上可用的 OpenCL 运行时 / 显卡驱动
+- CMake
+- GCC、Clang 或 MSVC 中的一种可用编译器
+
+如果你改回 `device_type='cuda'`，则仍需要：
 
 - Linux 或 WSL2
 - CMake 3.28 或更高版本

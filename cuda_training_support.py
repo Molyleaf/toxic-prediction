@@ -33,9 +33,19 @@ DEFAULT_DATA_FILE = "质谱数据汇总_处理后后后2.csv"
 DEFAULT_TARGET_COLUMN = "毒性"
 RETENTION_TIME_COLUMN = "RETENTION_TIME"
 RETENTION_TIME_NUMBER_PATTERN = re.compile(r"-?(?:\d+(?:\.\d*)?|\.\d+)")
+LIGHTGBM_GPU_PIP_INSTALL_COMMAND = (
+    "pip install lightgbm --no-binary lightgbm "
+    "--config-settings=cmake.define.USE_GPU=ON"
+)
 LIGHTGBM_CUDA_PIP_INSTALL_COMMAND = (
     "pip install lightgbm --no-binary lightgbm "
     "--config-settings=cmake.define.USE_CUDA=ON"
+)
+LIGHTGBM_GPU_SOURCE_BUILD_COMMANDS = (
+    "git clone --recursive https://github.com/microsoft/LightGBM\n"
+    "cd LightGBM\n"
+    "cmake -B build -S . -DUSE_GPU=ON\n"
+    "cmake --build build -j4"
 )
 LIGHTGBM_CUDA_SOURCE_BUILD_COMMANDS = (
     "git clone --recursive https://github.com/microsoft/LightGBM\n"
@@ -47,8 +57,10 @@ DEFAULT_SMOTE_SAMPLING_STRATEGY = 0.75
 DEFAULT_INITIAL_THRESHOLD = 0.42
 DEFAULT_CALIBRATION_METHOD = "isotonic"
 DEFAULT_BORDERLINE_SMOTE_KIND = "borderline-1"
+DEFAULT_LGBM_DEVICE_TYPE = "gpu"
 DEFAULT_LGBM_MAX_BIN = 255
-ARTIFACTS_VERSION = 2
+DEFAULT_LGBM_GPU_MAX_BIN = 63
+ARTIFACTS_VERSION = 3
 
 
 @dataclass(frozen=True)
@@ -57,6 +69,7 @@ class NotebookRunConfig:
     cv_folds: int
     random_seed: int
     test_size: float
+    device_type: str
     model_n_jobs: int
     search_n_jobs: int
     smote_k_neighbors: int
@@ -74,6 +87,7 @@ def format_notebook_run_summary(
     lines = [
         f"随机种子: {config.random_seed}",
         f"测试集比例: {config.test_size}",
+        f"训练设备: {config.device_type}",
         f"BayesSearch n_iter: {config.bayes_n_iter}",
         f"CV folds: {config.cv_folds}",
         f"模型 n_jobs: {config.model_n_jobs}",
@@ -98,9 +112,23 @@ def resolve_recommended_model_n_jobs(explicit_n_jobs: Optional[int] = None) -> i
         return resolved
 
     cpu_count = os.cpu_count() or 8
-    # LightGBM 的 CUDA 训练仍依赖 CPU 侧做直方图构建与数据调度；
+    # LightGBM 的 GPU / CUDA 训练仍依赖 CPU 侧做直方图构建与数据调度；
     # 默认给到 4~16 个线程，避免 4090 被单线程喂数拖慢。
     return int(max(4, min(16, cpu_count)))
+
+
+def normalize_lightgbm_device_type(device_type: Optional[str] = None) -> str:
+    resolved = str(DEFAULT_LGBM_DEVICE_TYPE if device_type is None else device_type).strip().lower()
+    if resolved not in {"gpu", "cuda"}:
+        raise ValueError("device_type 只支持 'gpu' 或 'cuda'，项目已禁用 CPU fallback。")
+    return resolved
+
+
+def resolve_lightgbm_max_bin(device_type: Optional[str] = None) -> int:
+    resolved_device_type = normalize_lightgbm_device_type(device_type)
+    if resolved_device_type == "gpu":
+        return int(DEFAULT_LGBM_GPU_MAX_BIN)
+    return int(DEFAULT_LGBM_MAX_BIN)
 
 
 def normalize_probability_calibration_method(method: Optional[str]) -> str:
@@ -140,6 +168,40 @@ def get_lightgbm_cuda_installation_notes() -> str:
     return "\n".join(lines)
 
 
+def get_lightgbm_gpu_installation_notes() -> str:
+    system_name = platform.system()
+    lines = []
+
+    if system_name == "Windows":
+        lines.append("检测到当前系统为 Windows。LightGBM 的 OpenCL GPU 路径可在 Windows 上使用。")
+        lines.append("请确认显卡驱动和 OpenCL runtime 已可用，再继续安装 GPU 版 LightGBM。")
+    elif system_name == "Linux":
+        lines.append("检测到当前系统为 Linux。请确认 OpenCL runtime 与显卡驱动已可用。")
+    else:
+        lines.append(
+            f"检测到当前系统为 {system_name}。请先确认该系统具备可用的 OpenCL runtime。"
+        )
+
+    lines.extend(
+        [
+            "",
+            "Python 包源码安装命令:",
+            f"  {LIGHTGBM_GPU_PIP_INSTALL_COMMAND}",
+            "",
+            "如需先手工编译 LightGBM，可使用:",
+            LIGHTGBM_GPU_SOURCE_BUILD_COMMANDS,
+        ]
+    )
+    return "\n".join(lines)
+
+
+def get_lightgbm_device_installation_notes(device_type: Optional[str] = None) -> str:
+    resolved_device_type = normalize_lightgbm_device_type(device_type)
+    if resolved_device_type == "gpu":
+        return get_lightgbm_gpu_installation_notes()
+    return get_lightgbm_cuda_installation_notes()
+
+
 def resolve_data_path(
     data_file_name: str = DEFAULT_DATA_FILE,
     start_dir: Optional[Path] = None,
@@ -162,6 +224,7 @@ def build_notebook_run_config(
     cv_folds: Optional[int] = None,
     random_seed: Optional[int] = None,
     test_size: Optional[float] = None,
+    device_type: Optional[str] = None,
     model_n_jobs: Optional[int] = None,
     search_n_jobs: Optional[int] = None,
     smote_k_neighbors: Optional[int] = None,
@@ -175,6 +238,7 @@ def build_notebook_run_config(
     resolved_test_size = float(0.2 if test_size is None else test_size)
     resolved_bayes_n_iter = int(48 if bayes_n_iter is None else bayes_n_iter)
     resolved_cv_folds = int(5 if cv_folds is None else cv_folds)
+    resolved_device_type = normalize_lightgbm_device_type(device_type)
 
     # GPU 搜索仍保持串行，避免多个 worker 同时争抢同一张卡。
     resolved_model_n_jobs = resolve_recommended_model_n_jobs(model_n_jobs)
@@ -222,6 +286,7 @@ def build_notebook_run_config(
         cv_folds=resolved_cv_folds,
         random_seed=resolved_random_seed,
         test_size=resolved_test_size,
+        device_type=resolved_device_type,
         model_n_jobs=resolved_model_n_jobs,
         search_n_jobs=resolved_search_n_jobs,
         smote_k_neighbors=resolved_smote_k_neighbors,
@@ -898,7 +963,7 @@ class FoldSafeSmoteLGBMClassifier(ClassifierMixin, BaseEstimator):
     def __init__(
         self,
         random_state: int = 42,
-        device_type: str = "cuda",
+        device_type: str = DEFAULT_LGBM_DEVICE_TYPE,
         model_n_jobs: int = 8,
         smote_k_neighbors: int = 5,
         smote_sampling_strategy: float = DEFAULT_SMOTE_SAMPLING_STRATEGY,
@@ -917,7 +982,7 @@ class FoldSafeSmoteLGBMClassifier(ClassifierMixin, BaseEstimator):
         reg_lambda: float = 0.0,
     ):
         self.random_state = random_state
-        self.device_type = device_type
+        self.device_type = normalize_lightgbm_device_type(device_type)
         self.model_n_jobs = model_n_jobs
         self.smote_k_neighbors = smote_k_neighbors
         self.smote_sampling_strategy = smote_sampling_strategy
@@ -975,17 +1040,19 @@ class FoldSafeSmoteLGBMClassifier(ClassifierMixin, BaseEstimator):
         )
 
     def _build_model(self, effective_scale_pos_weight: float = 1.0):
-        validate_cuda_only_requested(self.device_type)
+        resolved_device_type = normalize_lightgbm_device_type(self.device_type)
+        self.model_device_type_ = resolved_device_type
+        self.model_max_bin_ = resolve_lightgbm_max_bin(resolved_device_type)
 
         import lightgbm as lgb
 
         return lgb.LGBMClassifier(
             objective="binary",
-            device_type="cuda",
+            device_type=resolved_device_type,
             random_state=self.random_state,
             n_jobs=self.model_n_jobs,
             subsample_freq=1,
-            max_bin=DEFAULT_LGBM_MAX_BIN,
+            max_bin=self.model_max_bin_,
             num_leaves=self.num_leaves,
             learning_rate=self.learning_rate,
             n_estimators=self.n_estimators,
@@ -1088,6 +1155,8 @@ class FoldSafeSmoteLGBMClassifier(ClassifierMixin, BaseEstimator):
                 "当前超参数组合训练出的 LightGBM 未产生任何有效分裂，模型已崩塌。"
                 f" best_iteration={self.best_iteration_},"
                 f" total_split_count={self.total_split_count_},"
+                f" device_type={self.model_device_type_},"
+                f" max_bin={self.model_max_bin_},"
                 f" fit_class_counts={self.fit_class_counts_},"
                 f" resampled_class_counts={self.model_fit_class_counts_},"
                 f" scale_pos_weight={self.effective_scale_pos_weight_:.6f},"
@@ -1161,15 +1230,23 @@ def prepare_lightgbm_training_data(
 
 
 def validate_cuda_only_requested(device_type: str = "cuda") -> None:
-    if device_type.strip().lower() != "cuda":
-        raise RuntimeError("训练设备被强制限定为 CUDA，项目已禁用 CPU / GPU 的静默 fallback。")
+    resolved_device_type = normalize_lightgbm_device_type(device_type)
+    if resolved_device_type != "cuda":
+        raise RuntimeError(
+            "当前 helper 仅用于 CUDA 专用预检；如需 GPU/OpenCL 预检，请改用 "
+            "validate_lightgbm_accelerated_build(device_type='gpu')."
+        )
 
 
-def validate_lightgbm_cuda_build(
-    device_type: str = "cuda",
+def validate_accelerated_device_requested(device_type: Optional[str] = None) -> str:
+    return normalize_lightgbm_device_type(device_type)
+
+
+def validate_lightgbm_accelerated_build(
+    device_type: Optional[str] = None,
     random_state: int = 42,
 ) -> str:
-    validate_cuda_only_requested(device_type)
+    resolved_device_type = validate_accelerated_device_requested(device_type)
 
     import lightgbm as lgb
 
@@ -1188,10 +1265,11 @@ def validate_lightgbm_cuda_build(
 
     probe = lgb.LGBMClassifier(
         objective="binary",
-        device_type="cuda",
+        device_type=resolved_device_type,
         n_estimators=4,
         num_leaves=7,
         max_depth=3,
+        max_bin=resolve_lightgbm_max_bin(resolved_device_type),
         min_data_in_leaf=1,
         random_state=random_state,
         n_jobs=1,
@@ -1203,19 +1281,30 @@ def validate_lightgbm_cuda_build(
         probe.predict_proba(X_probe)
     except Exception as exc:  # pragma: no cover - runtime environment dependent
         lgbm_version = getattr(lgb, "__version__", "unknown")
+        build_requirement = "启用 USE_CUDA=1 的构建" if resolved_device_type == "cuda" else "启用 USE_GPU=ON / OpenCL 的构建"
         raise RuntimeError(
-            "当前 LightGBM 不能以 CUDA 模式训练。\n"
-            f"已检测到 lightgbm=={lgbm_version}，但它不是启用 USE_CUDA=1 的构建。\n"
+            f"当前 LightGBM 不能以 {resolved_device_type} 模式训练。\n"
+            f"已检测到 lightgbm=={lgbm_version}，但它不是 {build_requirement}。\n"
             "项目已禁用任何静默 fallback。\n"
-            f"{get_lightgbm_cuda_installation_notes()}"
+            f"{get_lightgbm_device_installation_notes(resolved_device_type)}"
         ) from exc
 
     return getattr(lgb, "__version__", "unknown")
 
 
+def validate_lightgbm_cuda_build(
+    device_type: str = "cuda",
+    random_state: int = 42,
+) -> str:
+    return validate_lightgbm_accelerated_build(
+        device_type=device_type,
+        random_state=random_state,
+    )
+
+
 def build_lgbm_classifier(
     random_state: int = 42,
-    device_type: str = "cuda",
+    device_type: str = DEFAULT_LGBM_DEVICE_TYPE,
     model_n_jobs: Optional[int] = None,
     smote_k_neighbors: int = 5,
     smote_sampling_strategy: float = DEFAULT_SMOTE_SAMPLING_STRATEGY,
@@ -1359,6 +1448,8 @@ def save_lightgbm_inference_artifacts(
         "classification_threshold": classification_threshold,
         "threshold_selection_metadata": threshold_selection_metadata,
         "probability_calibration_bundle": compact_probability_calibration_bundle,
+        "device_type": getattr(estimator, "model_device_type_", getattr(estimator, "device_type", None)),
+        "max_bin": getattr(estimator, "model_max_bin_", None),
         "resampler_name": getattr(estimator, "resampler_name_", None),
         "resampling_metadata": getattr(estimator, "resampling_metadata_", None),
         "training_diagnostics": getattr(estimator, "training_diagnostics_", None),
@@ -1400,6 +1491,8 @@ def save_lightgbm_inference_artifacts(
         "classification_threshold": classification_threshold,
         "threshold_selection_metadata": threshold_selection_metadata,
         "probability_calibration": probability_calibration_metadata,
+        "device_type": getattr(estimator, "model_device_type_", getattr(estimator, "device_type", None)),
+        "max_bin": getattr(estimator, "model_max_bin_", None),
         "resampler_name": getattr(estimator, "resampler_name_", None),
         "resampling_metadata": getattr(estimator, "resampling_metadata_", None),
         "training_diagnostics": getattr(estimator, "training_diagnostics_", None),
