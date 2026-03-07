@@ -9,6 +9,7 @@
 
 - 只在每个交叉验证训练折内部执行 Borderline-SMOTE 增样。
 - `scale_pos_weight` 只按“重采样后的新标签分布”自动计算。
+- 如果某组参数训练出零分裂模型（all-zero feature importance / 常数预测），会直接判定该候选无效。
 - 外层验证集、OOF 与最终测试集始终保持原始真实分布。
 - 阈值选择直接基于 CV/OOF。
 - 模型输出后会进行严格的概率校准，并把校准器一起导出。
@@ -41,7 +42,8 @@
 2. 再从该训练折中切出一小块 early stopping 验证集，这块验证集不参与任何重采样。
 3. 只对该折的训练子集做 Borderline-SMOTE 增样，用来扩训练样本量，尽量减少高维空间中的跨界插值风险。
 4. 基于 Borderline-SMOTE 之后的新标签分布自动计算 `scale_pos_weight`。
-5. 用原始、未污染的外层验证集做交叉验证评分。
+5. 训练完成后检查 booster 是否产生了有效分裂；零分裂候选会被直接拒收，不允许进入搜索结果。
+6. 用原始、未污染的外层验证集做交叉验证评分。
 
 这意味着：
 
@@ -51,28 +53,27 @@
 
 ### 2. 超参数搜索方向
 
-新的搜索范围优先扩三件事：
+新的搜索范围优先做两件事：
 
-- 树结构容量
-- boosting 长度与速度
-- 分裂门槛
+- 保留足够的树容量与 boosting 长度
+- 优先避免把分裂门槛和正则一开始就抬得过高
 
-而不是先把 L1/L2 正则大幅抬高。
+目标是先让搜索稳定找到“能分裂、能学习”的候选，再在这个基础上继续比较泛化表现。
 
 Notebook 顶部默认搜索空间如下：
 
 ```python
 NOTEBOOK_LGBM_SEARCH_SPACES = {
-    "num_leaves": Integer(48, 127),
-    "learning_rate": Real(8e-3, 3e-2, prior="log-uniform"),
-    "n_estimators": Integer(2500, 6000),
-    "max_depth": Categorical([6, 7, 8, 9]),
-    "subsample": Real(0.80, 1.00),
-    "colsample_bytree": Real(0.80, 1.00),
-    "min_child_samples": Integer(60, 160),
-    "min_split_gain": Real(0.08, 0.60, prior="log-uniform"),
-    "reg_alpha": Real(5e-2, 1.5, prior="log-uniform"),
-    "reg_lambda": Real(2.0, 20.0, prior="log-uniform"),
+    "num_leaves": Integer(24, 127),
+    "learning_rate": Real(1e-2, 8e-2, prior="log-uniform"),
+    "n_estimators": Integer(1200, 4500),
+    "max_depth": Categorical([4, 5, 6, 7, 8, 9]),
+    "subsample": Real(0.75, 1.00),
+    "colsample_bytree": Real(0.75, 1.00),
+    "min_child_samples": Integer(10, 80),
+    "min_split_gain": Real(1e-4, 0.12, prior="log-uniform"),
+    "reg_alpha": Real(1e-3, 0.6, prior="log-uniform"),
+    "reg_lambda": Real(1e-2, 8.0, prior="log-uniform"),
 }
 ```
 
@@ -81,6 +82,7 @@ NOTEBOOK_LGBM_SEARCH_SPACES = {
 - `NOTEBOOK_BAYES_N_ITER = 48`
 - `NOTEBOOK_EARLY_STOPPING_ROUNDS = 300`
 - `NOTEBOOK_INITIAL_THRESHOLD = 0.42`
+- `BayesSearchCV(error_score=0.0)`，允许个别崩塌候选被跳过而不是整轮中断
 
 ### 3. 阈值与概率校准
 
@@ -97,6 +99,8 @@ NOTEBOOK_LGBM_SEARCH_SPACES = {
 3. 在 OOF 原始概率上拟合概率校准器。
 4. 用校准后的 OOF 概率进行阈值探测与选择。
 5. 再把该校准器应用到最终 refit 模型的输出上，对测试集做最终评估。
+
+如果最终 `best_score_ <= 0.5`，notebook 会直接抛出异常并停止，不再继续输出一个实际上不可用的常数模型。
 
 默认校准策略：
 
@@ -130,6 +134,11 @@ LightGBM 的 CUDA 训练并不是只有 GPU 在工作，CPU 仍然负责一部�
 2. 读取 CSV、清洗 `RETENTION_TIME`、切分训练集和测试集、做 CUDA 预检。
 3. 跑单路径 `BayesSearchCV`，得到最终 `best_estimator_`。
 4. 生成 OOF 原始概率、做概率校准、在校准后的 OOF 上选阈值、评估测试集、导出模型资产。
+
+第三个代码单元现在还会做两层保护：
+
+- 候选模型如果训练后没有任何有效分裂，会被直接判定为崩塌候选。
+- 特征重要性绘图前会先检查是否存在非零 importance，避免训练已经失败时在绘图阶段再次报错。
 
 ### Notebook 顶部关键参数
 

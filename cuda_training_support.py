@@ -529,6 +529,79 @@ def compute_scale_pos_weight_from_labels(
     return float(negative_count / positive_count)
 
 
+def build_booster_feature_importance_frame(
+    booster: Any,
+    importance_type: str = "split",
+    ignore_zero: bool = False,
+) -> pd.DataFrame:
+    if booster is None:
+        return pd.DataFrame(columns=["feature", "importance"])
+
+    feature_names = list(booster.feature_name())
+    importance_values = np.asarray(
+        booster.feature_importance(importance_type=importance_type),
+        dtype="float64",
+    )
+    if not feature_names or importance_values.size == 0:
+        return pd.DataFrame(columns=["feature", "importance"])
+    if len(feature_names) != int(importance_values.size):
+        raise ValueError("LightGBM booster 返回的特征名数量与 importance 数量不一致。")
+
+    importance_frame = pd.DataFrame(
+        {
+            "feature": feature_names,
+            "importance": importance_values,
+        }
+    )
+    if ignore_zero:
+        importance_frame = importance_frame.loc[importance_frame["importance"] > 0]
+    if importance_frame.empty:
+        return pd.DataFrame(columns=["feature", "importance"])
+
+    return importance_frame.sort_values(
+        by=["importance", "feature"],
+        ascending=[False, True],
+    ).reset_index(drop=True)
+
+
+def summarize_lightgbm_booster_training_diagnostics(
+    booster: Any,
+) -> Dict[str, Any]:
+    split_importance = build_booster_feature_importance_frame(
+        booster,
+        importance_type="split",
+        ignore_zero=False,
+    )
+    gain_importance = build_booster_feature_importance_frame(
+        booster,
+        importance_type="gain",
+        ignore_zero=False,
+    )
+
+    if split_importance.empty:
+        total_split_count = 0
+        non_zero_split_feature_count = 0
+    else:
+        split_values = split_importance["importance"].astype("float64")
+        total_split_count = int(split_values.sum())
+        non_zero_split_feature_count = int((split_values > 0).sum())
+
+    total_gain = (
+        float(gain_importance["importance"].astype("float64").sum())
+        if not gain_importance.empty
+        else 0.0
+    )
+    tree_count = int(booster.num_trees()) if booster is not None else 0
+
+    return {
+        "tree_count": tree_count,
+        "total_split_count": total_split_count,
+        "non_zero_split_feature_count": non_zero_split_feature_count,
+        "total_gain": total_gain,
+        "is_degenerate": bool(total_split_count <= 0),
+    }
+
+
 def resample_training_fold_with_borderline_smote(
     X: pd.DataFrame,
     y: pd.Series,
@@ -1002,6 +1075,29 @@ class FoldSafeSmoteLGBMClassifier(ClassifierMixin, BaseEstimator):
         self.classes_ = getattr(self.model_, "classes_", np.sort(y_series.unique()))
         self.booster_ = self.model_.booster_
         self.best_iteration_ = getattr(self.model_, "best_iteration_", None)
+        self.training_diagnostics_ = summarize_lightgbm_booster_training_diagnostics(
+            self.booster_
+        )
+        self.total_split_count_ = int(self.training_diagnostics_["total_split_count"])
+        self.non_zero_split_feature_count_ = int(
+            self.training_diagnostics_["non_zero_split_feature_count"]
+        )
+        self.total_gain_ = float(self.training_diagnostics_["total_gain"])
+        if self.training_diagnostics_["is_degenerate"]:
+            raise RuntimeError(
+                "当前超参数组合训练出的 LightGBM 未产生任何有效分裂，模型已崩塌。"
+                f" best_iteration={self.best_iteration_},"
+                f" total_split_count={self.total_split_count_},"
+                f" fit_class_counts={self.fit_class_counts_},"
+                f" resampled_class_counts={self.model_fit_class_counts_},"
+                f" scale_pos_weight={self.effective_scale_pos_weight_:.6f},"
+                f" num_leaves={self.num_leaves},"
+                f" max_depth={self.max_depth},"
+                f" min_child_samples={self.min_child_samples},"
+                f" min_split_gain={self.min_split_gain},"
+                f" reg_alpha={self.reg_alpha},"
+                f" reg_lambda={self.reg_lambda}."
+            )
 
         return self
 
@@ -1265,6 +1361,7 @@ def save_lightgbm_inference_artifacts(
         "probability_calibration_bundle": compact_probability_calibration_bundle,
         "resampler_name": getattr(estimator, "resampler_name_", None),
         "resampling_metadata": getattr(estimator, "resampling_metadata_", None),
+        "training_diagnostics": getattr(estimator, "training_diagnostics_", None),
         "pre_resample_scale_pos_weight": getattr(estimator, "pre_resample_scale_pos_weight_", None),
         "effective_scale_pos_weight": getattr(estimator, "effective_scale_pos_weight_", None),
         "scale_pos_weight_source": getattr(estimator, "scale_pos_weight_source_", None),
@@ -1305,6 +1402,7 @@ def save_lightgbm_inference_artifacts(
         "probability_calibration": probability_calibration_metadata,
         "resampler_name": getattr(estimator, "resampler_name_", None),
         "resampling_metadata": getattr(estimator, "resampling_metadata_", None),
+        "training_diagnostics": getattr(estimator, "training_diagnostics_", None),
         "pre_resample_scale_pos_weight": getattr(estimator, "pre_resample_scale_pos_weight_", None),
         "effective_scale_pos_weight": getattr(estimator, "effective_scale_pos_weight_", None),
         "scale_pos_weight_source": getattr(estimator, "scale_pos_weight_source_", None),
