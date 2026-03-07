@@ -14,7 +14,9 @@ The core of this project is a mass-spectrometry-based toxicity classifier. The r
 * **Genotoxicity Prediction**: Predicts substance genotoxicity based on mass spectrometry data.
 * **Pre-trained Model**: Includes a ready-to-use model trained on the Massbank dataset.
 * **CUDA-only Training Notebook**: LightGBM training is pinned to `device_type='cuda'` and performs a preflight check before any real training starts.
-* **Notebook-first Training Flow**: the first cell of `lightgbm/light_model.ipynb` now centralizes imports, path fixes, and training hyperparameters before the next cell runs the full training pipeline.
+* **Notebook-first Training Flow**: the notebook is organized into config/imports, pre-training diagnostics, and a single training-and-save block.
+* **Notebook Progress Bar**: BayesSearchCV progress is shown in the notebook through `tqdm.auto`.
+* **Native LightGBM Export**: the best trained booster is saved to `models/lightgbm_cuda_model.txt`.
 * **Web Interface**: Provides a simple and user-friendly frontend for making predictions.
 * **Containerized**: Includes a `Dockerfile` for quick and easy deployment using Docker.
 
@@ -112,9 +114,10 @@ Key behavior:
 
 * Training is locked to `cuda`.
 * CPU fallback is disabled on purpose.
-* The first code cell centralizes imports, path fixes, and `NOTEBOOK_*` globals.
+* The first code cell centralizes imports, path fixes, `NOTEBOOK_*` globals, and the output path for the saved model.
 * `NOTEBOOK_CONFIG` is built from those globals, so edit that first cell and rerun the notebook from the top when you want to change training behavior.
-* The second code cell runs the full data loading, preprocessing, CUDA preflight, and BayesSearchCV training path.
+* The second code cell runs data loading, preprocessing, and consolidated diagnostics before any fitting starts.
+* The third code cell runs the only BayesSearchCV training pass, shows a `tqdm.auto` progress bar, evaluates the best estimator, and saves it in native LightGBM format.
 
 Main globals in the first notebook cell:
 
@@ -127,7 +130,7 @@ NOTEBOOK_MODEL_N_JOBS = 1
 NOTEBOOK_SEARCH_N_JOBS = 1
 NOTEBOOK_SMOTE_K_NEIGHBORS = 5
 NOTEBOOK_BAYES_SCORING = "roc_auc"
-NOTEBOOK_BAYES_VERBOSE = 1
+NOTEBOOK_BAYES_VERBOSE = 0
 ```
 
 The same top cell also defines `NOTEBOOK_LGBM_SEARCH_SPACES` so the LightGBM search space is centralized with the rest of the notebook hyperparameters.
@@ -136,9 +139,12 @@ The notebook training flow covers:
 
 * CSV loading
 * feature preprocessing
+* training diagnostics before fitting
 * notebook-local SMOTE replacement
 * CUDA preflight for LightGBM
 * a full BayesSearchCV training loop with stronger regularization to reduce overfitting
+* notebook progress tracking through `tqdm.auto`
+* exporting the best booster to `models/lightgbm_cuda_model.txt`
 
 If the installed `lightgbm` package was not compiled with CUDA support, the notebook will fail fast with an explicit error instead of silently falling back to CPU.
 
