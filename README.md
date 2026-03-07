@@ -14,7 +14,7 @@ The core of this project is a mass-spectrometry-based toxicity classifier. The r
 * **Genotoxicity Prediction**: Predicts substance genotoxicity based on mass spectrometry data.
 * **Pre-trained Model**: Includes a ready-to-use model trained on the Massbank dataset.
 * **CUDA-only Training Notebook**: LightGBM training is pinned to `device_type='cuda'` and performs a preflight check before any real training starts.
-* **Notebook Smoke Validation**: the first section of `lightgbm/light_model.ipynb` verifies the training chain on a reduced sample before the rest of the notebook reuses the same globals.
+* **Notebook-first Training Flow**: the first cell of `lightgbm/light_model.ipynb` now centralizes imports, path fixes, and training hyperparameters before the next cell runs the full training pipeline.
 * **Web Interface**: Provides a simple and user-friendly frontend for making predictions.
 * **Containerized**: Includes a `Dockerfile` for quick and easy deployment using Docker.
 
@@ -112,19 +112,17 @@ Key behavior:
 
 * Training is locked to `cuda`.
 * CPU fallback is disabled on purpose.
-* The notebook starts with a **smoke validation** block so you can validate the pipeline without launching a second entrypoint.
-* All notebook hyperparameters are defined in the first code cell as `NOTEBOOK_*` globals.
+* The first code cell centralizes imports, path fixes, and `NOTEBOOK_*` globals.
 * `NOTEBOOK_CONFIG` is built from those globals, so edit that first cell and rerun the notebook from the top when you want to change training behavior.
+* The second code cell runs the full data loading, preprocessing, CUDA preflight, and BayesSearchCV training path.
 
 Main globals in the first notebook cell:
 
 ```python
-NOTEBOOK_RUN_MODE = "smoke"  # or "full"
-NOTEBOOK_SAMPLE_SIZE = 1024 if NOTEBOOK_RUN_MODE == "smoke" else 0
-NOTEBOOK_BAYES_N_ITER = 2 if NOTEBOOK_RUN_MODE == "smoke" else 32
-NOTEBOOK_CV_FOLDS = 2 if NOTEBOOK_RUN_MODE == "smoke" else 5
-NOTEBOOK_RANDOM_SEED = 42
-NOTEBOOK_TEST_SIZE = 0.2
+NOTEBOOK_RANDOM_SEED = 114514
+NOTEBOOK_TEST_SIZE = 0.25
+NOTEBOOK_BAYES_N_ITER = 24
+NOTEBOOK_CV_FOLDS = 5
 NOTEBOOK_MODEL_N_JOBS = 1
 NOTEBOOK_SEARCH_N_JOBS = 1
 NOTEBOOK_SMOTE_K_NEIGHBORS = 5
@@ -132,15 +130,15 @@ NOTEBOOK_BAYES_SCORING = "roc_auc"
 NOTEBOOK_BAYES_VERBOSE = 1
 ```
 
-The same top cell also defines `NOTEBOOK_SMOKE_SEARCH_SPACES`, `NOTEBOOK_FULL_SEARCH_SPACES`, and `NOTEBOOK_LGBM_SEARCH_SPACES` so the LightGBM search space is centralized with the rest of the notebook hyperparameters.
+The same top cell also defines `NOTEBOOK_LGBM_SEARCH_SPACES` so the LightGBM search space is centralized with the rest of the notebook hyperparameters.
 
-The first notebook section performs the reduced-scope smoke validation. It covers:
+The notebook training flow covers:
 
 * CSV loading
 * feature preprocessing
 * notebook-local SMOTE replacement
 * CUDA preflight for LightGBM
-* a reduced BayesSearchCV training loop
+* a full BayesSearchCV training loop with stronger regularization to reduce overfitting
 
 If the installed `lightgbm` package was not compiled with CUDA support, the notebook will fail fast with an explicit error instead of silently falling back to CPU.
 

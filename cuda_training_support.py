@@ -28,8 +28,6 @@ LIGHTGBM_CUDA_SOURCE_BUILD_COMMANDS = (
 
 @dataclass(frozen=True)
 class NotebookRunConfig:
-    run_mode: str
-    sample_size: int
     bayes_n_iter: int
     cv_folds: int
     random_seed: int
@@ -44,10 +42,8 @@ def format_notebook_run_summary(
     data_path: Optional[Path] = None,
 ) -> str:
     lines = [
-        f"训练模式: {config.run_mode}",
         f"随机种子: {config.random_seed}",
         f"测试集比例: {config.test_size}",
-        f"Smoke sample size: {config.sample_size}",
         f"BayesSearch n_iter: {config.bayes_n_iter}",
         f"CV folds: {config.cv_folds}",
         f"模型 n_jobs: {config.model_n_jobs}",
@@ -102,8 +98,6 @@ def resolve_data_path(
 
 
 def build_notebook_run_config(
-    run_mode: Optional[str] = None,
-    sample_size: Optional[int] = None,
     bayes_n_iter: Optional[int] = None,
     cv_folds: Optional[int] = None,
     random_seed: Optional[int] = None,
@@ -112,29 +106,16 @@ def build_notebook_run_config(
     search_n_jobs: Optional[int] = None,
     smote_k_neighbors: Optional[int] = None,
 ) -> NotebookRunConfig:
-    resolved_run_mode = (run_mode if run_mode is not None else "smoke").strip().lower()
-    if resolved_run_mode not in {"smoke", "full"}:
-        raise ValueError("run_mode 只能是 'smoke' 或 'full'。")
-
     resolved_random_seed = int(42 if random_seed is None else random_seed)
     resolved_test_size = float(0.2 if test_size is None else test_size)
-
-    default_sample_size = 1024 if resolved_run_mode == "smoke" else 0
-    resolved_sample_size = int(default_sample_size if sample_size is None else sample_size)
-
-    default_bayes_n_iter = 2 if resolved_run_mode == "smoke" else 32
-    resolved_bayes_n_iter = int(default_bayes_n_iter if bayes_n_iter is None else bayes_n_iter)
-
-    default_cv_folds = 2 if resolved_run_mode == "smoke" else 5
-    resolved_cv_folds = int(default_cv_folds if cv_folds is None else cv_folds)
+    resolved_bayes_n_iter = int(24 if bayes_n_iter is None else bayes_n_iter)
+    resolved_cv_folds = int(5 if cv_folds is None else cv_folds)
 
     # GPU 训练与交叉验证并发通常会争抢同一张卡，这里默认串行执行搜索。
     resolved_model_n_jobs = int(1 if model_n_jobs is None else model_n_jobs)
     resolved_search_n_jobs = int(1 if search_n_jobs is None else search_n_jobs)
     resolved_smote_k_neighbors = int(5 if smote_k_neighbors is None else smote_k_neighbors)
 
-    if resolved_sample_size < 0:
-        raise ValueError("sample_size 不能为负数。")
     if resolved_bayes_n_iter <= 0:
         raise ValueError("bayes_n_iter 必须为正整数。")
     if resolved_cv_folds <= 1:
@@ -147,8 +128,6 @@ def build_notebook_run_config(
         raise ValueError("smote_k_neighbors 必须为正整数。")
 
     return NotebookRunConfig(
-        run_mode=resolved_run_mode,
-        sample_size=resolved_sample_size,
         bayes_n_iter=resolved_bayes_n_iter,
         cv_folds=resolved_cv_folds,
         random_seed=resolved_random_seed,
@@ -162,21 +141,9 @@ def build_notebook_run_config(
 def load_training_dataframe(
     data_path: Path,
     random_seed: int,
-    run_mode: str,
-    sample_size: int,
-    target_column: str = DEFAULT_TARGET_COLUMN,
 ) -> pd.DataFrame:
     data = pd.read_csv(data_path)
     data = data.sample(frac=1, random_state=random_seed)
-
-    if run_mode == "smoke" and 0 < sample_size < len(data):
-        sampled_index, _ = train_test_split(
-            data.index,
-            train_size=sample_size,
-            random_state=random_seed,
-            stratify=data[target_column],
-        )
-        data = data.loc[sampled_index].copy()
 
     return data.reset_index(drop=True)
 
@@ -282,6 +249,7 @@ def prepare_lightgbm_training_data(
         y,
         test_size=test_size,
         random_state=random_state,
+        stratify=y,
     )
 
     numeric_features = X_train.select_dtypes(include=["number"]).columns.tolist()
@@ -420,5 +388,9 @@ def build_lgbm_classifier(
         device_type="cuda",
         random_state=random_state,
         n_jobs=model_n_jobs,
+        subsample_freq=1,
+        reg_alpha=0.1,
+        reg_lambda=5.0,
+        min_split_gain=0.05,
         verbosity=-1,
     )
