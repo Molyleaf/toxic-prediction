@@ -171,6 +171,39 @@ pip install -r requirements.txt
 
 训练 notebook 现在额外依赖 `imbalanced-learn`，用于折内 Borderline-SMOTE。
 
+为避免 `numpy.dtype size changed` 这类 ABI 报错，`requirements.txt` 已固定以下核心版本：
+
+- `numpy==2.2.6`
+- `pandas==2.2.3`
+- `scikit-learn==1.6.1`
+- `imbalanced-learn>=0.14,<0.15`
+
+如果你的 Linux / Python 3.10 环境之前已经装过其他版本，建议先把科学计算栈强制重装一遍：
+
+```bash
+python -m pip uninstall -y numpy pandas scipy scikit-learn imbalanced-learn
+python -m pip install --no-cache-dir --force-reinstall \
+  "numpy==2.2.6" \
+  "pandas==2.2.3" \
+  "scikit-learn==1.6.1" \
+  "imbalanced-learn>=0.14,<0.15"
+python -m pip install -r requirements.txt
+```
+
+如果你看到下面这类错误：
+
+```text
+ValueError: numpy.dtype size changed, may indicate binary incompatibility
+```
+
+这通常说明：
+
+- 你先装了某个版本的 `pandas` / `scikit-learn`
+- 后面又单独升级或降级了 `numpy`
+- 旧 wheel 仍然链接着另一套 `numpy` ABI
+
+这时不要只重装 `pandas`，而是按上面的命令把整套科学计算依赖一起重装。
+
 ### 2. 安装 CUDA 版 LightGBM
 
 项目训练链路固定要求 `device_type='cuda'`，不会静默回退到 CPU。

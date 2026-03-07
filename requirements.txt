@@ -1,8 +1,9 @@
 flask
-pandas
-numpy
+# 固定科学计算栈的核心版本，避免 numpy ABI 漂移导致 pandas / sklearn 的二进制不兼容。
+numpy==2.2.6
+pandas==2.2.3
+scikit-learn==1.6.1
 joblib
-scikit-learn
 scikit-learn-intelex
 openpyxl
 gunicorn
@@ -10,7 +11,7 @@ scikit-optimize
 matplotlib
 tqdm
 # 训练 notebook 使用 Borderline-SMOTE，需要 imbalanced-learn。
-imbalanced-learn
+imbalanced-learn>=0.14,<0.15
 # 训练 notebook 需要启用 CUDA 的 LightGBM 构建。
 # 仅 CPU 的 wheel 会在预检阶段被明确拒绝。
 lightgbm
