@@ -11,6 +11,15 @@ import joblib
 import numpy as np
 import pandas as pd
 from sklearn.base import BaseEstimator, ClassifierMixin
+from sklearn.metrics import (
+    accuracy_score,
+    balanced_accuracy_score,
+    confusion_matrix,
+    f1_score,
+    precision_score,
+    recall_score,
+    roc_auc_score,
+)
 from sklearn.model_selection import train_test_split
 from sklearn.neighbors import NearestNeighbors
 from sklearn.preprocessing import StandardScaler
@@ -42,6 +51,8 @@ class NotebookRunConfig:
     model_n_jobs: int
     search_n_jobs: int
     smote_k_neighbors: int
+    early_stopping_rounds: int
+    early_stopping_validation_fraction: float
 
 
 def format_notebook_run_summary(
@@ -56,6 +67,8 @@ def format_notebook_run_summary(
         f"模型 n_jobs: {config.model_n_jobs}",
         f"搜索 n_jobs: {config.search_n_jobs}",
         f"SMOTE k_neighbors: {config.smote_k_neighbors}",
+        f"折内 early stopping rounds: {config.early_stopping_rounds}",
+        f"折内 early stopping 验证集比例: {config.early_stopping_validation_fraction}",
     ]
     if data_path is not None:
         lines.insert(1, f"数据文件: {data_path}")
@@ -112,6 +125,8 @@ def build_notebook_run_config(
     model_n_jobs: Optional[int] = None,
     search_n_jobs: Optional[int] = None,
     smote_k_neighbors: Optional[int] = None,
+    early_stopping_rounds: Optional[int] = None,
+    early_stopping_validation_fraction: Optional[float] = None,
 ) -> NotebookRunConfig:
     resolved_random_seed = int(42 if random_seed is None else random_seed)
     resolved_test_size = float(0.2 if test_size is None else test_size)
@@ -122,6 +137,14 @@ def build_notebook_run_config(
     resolved_model_n_jobs = int(1 if model_n_jobs is None else model_n_jobs)
     resolved_search_n_jobs = int(1 if search_n_jobs is None else search_n_jobs)
     resolved_smote_k_neighbors = int(5 if smote_k_neighbors is None else smote_k_neighbors)
+    resolved_early_stopping_rounds = int(
+        100 if early_stopping_rounds is None else early_stopping_rounds
+    )
+    resolved_early_stopping_validation_fraction = float(
+        0.15
+        if early_stopping_validation_fraction is None
+        else early_stopping_validation_fraction
+    )
 
     if resolved_bayes_n_iter <= 0:
         raise ValueError("bayes_n_iter 必须为正整数。")
@@ -133,6 +156,10 @@ def build_notebook_run_config(
         raise ValueError("model_n_jobs 和 search_n_jobs 必须为正整数。")
     if resolved_smote_k_neighbors <= 0:
         raise ValueError("smote_k_neighbors 必须为正整数。")
+    if resolved_early_stopping_rounds < 0:
+        raise ValueError("early_stopping_rounds 不能为负数。")
+    if not 0.0 < resolved_early_stopping_validation_fraction < 0.5:
+        raise ValueError("early_stopping_validation_fraction 必须在 0 和 0.5 之间。")
 
     return NotebookRunConfig(
         bayes_n_iter=resolved_bayes_n_iter,
@@ -142,6 +169,8 @@ def build_notebook_run_config(
         model_n_jobs=resolved_model_n_jobs,
         search_n_jobs=resolved_search_n_jobs,
         smote_k_neighbors=resolved_smote_k_neighbors,
+        early_stopping_rounds=resolved_early_stopping_rounds,
+        early_stopping_validation_fraction=resolved_early_stopping_validation_fraction,
     )
 
 
@@ -405,20 +434,86 @@ def notebook_smote_resample(
     return X_resampled, y_resampled
 
 
+def compute_binary_classification_metrics(
+    y_true: pd.Series | np.ndarray | list[Any],
+    positive_proba: pd.Series | np.ndarray | list[float],
+    threshold: float = 0.5,
+) -> Dict[str, Any]:
+    y_true_array = np.asarray(y_true, dtype=int)
+    positive_proba_array = np.asarray(positive_proba, dtype=float)
+    resolved_threshold = float(threshold)
+    y_pred_array = (positive_proba_array >= resolved_threshold).astype(int)
+
+    tn, fp, fn, tp = confusion_matrix(
+        y_true_array,
+        y_pred_array,
+        labels=[0, 1],
+    ).ravel()
+    specificity = float(tn / (tn + fp)) if (tn + fp) else 0.0
+
+    metrics = {
+        "threshold": resolved_threshold,
+        "AUC": float(roc_auc_score(y_true_array, positive_proba_array)),
+        "Accuracy": float(accuracy_score(y_true_array, y_pred_array)),
+        "Balanced Accuracy": float(balanced_accuracy_score(y_true_array, y_pred_array)),
+        "Precision": float(precision_score(y_true_array, y_pred_array, zero_division=0)),
+        "Recall": float(recall_score(y_true_array, y_pred_array, zero_division=0)),
+        "F1": float(f1_score(y_true_array, y_pred_array, zero_division=0)),
+        "Specificity": specificity,
+        "TN": int(tn),
+        "FP": int(fp),
+        "FN": int(fn),
+        "TP": int(tp),
+        "confusion_matrix": np.array([[tn, fp], [fn, tp]], dtype=int),
+    }
+    return metrics
+
+
+def probe_binary_classification_thresholds(
+    y_true: pd.Series | np.ndarray | list[Any],
+    positive_proba: pd.Series | np.ndarray | list[float],
+    thresholds: Optional[list[float] | np.ndarray] = None,
+) -> pd.DataFrame:
+    if thresholds is None:
+        thresholds = np.round(np.linspace(0.30, 0.70, 41), 3)
+
+    rows = []
+    for threshold in thresholds:
+        metrics = compute_binary_classification_metrics(
+            y_true=y_true,
+            positive_proba=positive_proba,
+            threshold=float(threshold),
+        )
+        rows.append(
+            {
+                key: value
+                for key, value in metrics.items()
+                if key not in {"confusion_matrix"}
+            }
+        )
+
+    return pd.DataFrame(rows).sort_values("threshold").reset_index(drop=True)
+
+
 class FoldSafeSmoteLGBMClassifier(BaseEstimator, ClassifierMixin):
     """
     LightGBM 二分类封装器。
 
     作用：
     - 在每个 `fit` 调用内部重新学习缺失值填充值与标准化器，避免 CV 泄漏。
-    - 仅在当前训练数据上执行 SMOTE，保证每个交叉验证训练折独立过采样。
+    - 在当前训练折内部再切一小块验证集，专门用于 early stopping。
+    - 支持在训练折内二选一地使用 SMOTE 或 `scale_pos_weight` 平衡类别。
     - 统一清洗 `RETENTION_TIME`，把类似 `17.9 and 18.5` 的多值文本解析为均值。
 
     关键超参数：
     - `random_state`: 统一控制数据处理、SMOTE 与 LightGBM 的随机性。
     - `device_type`: 训练设备，项目强制限定为 `cuda`。
     - `model_n_jobs`: LightGBM 单模型内部线程数。
+    - `balance_strategy`: 类别平衡策略，可选 `smote` 或 `scale_pos_weight`。
     - `smote_k_neighbors`: 折内 SMOTE 的近邻数。
+    - `scale_pos_weight`: 当使用 `scale_pos_weight` 时传给 LightGBM 的正类权重；为空则按折内训练子集自动计算。
+    - `early_stopping_rounds`: 折内 early stopping 的 patience；设为 0 表示禁用。
+    - `early_stopping_validation_fraction`: 从当前训练折中切出的验证集比例。
     - `num_leaves`: 单棵树的最大叶子数，越大越容易拟合复杂模式。
     - `learning_rate`: 每轮 boosting 的步长，越小通常越稳。
     - `n_estimators`: boosting 轮数，通常与 `learning_rate` 联动。
@@ -436,7 +531,11 @@ class FoldSafeSmoteLGBMClassifier(BaseEstimator, ClassifierMixin):
         random_state: int = 42,
         device_type: str = "cuda",
         model_n_jobs: int = 1,
+        balance_strategy: str = "smote",
         smote_k_neighbors: int = 5,
+        scale_pos_weight: Optional[float] = None,
+        early_stopping_rounds: int = 100,
+        early_stopping_validation_fraction: float = 0.15,
         num_leaves: int = 31,
         learning_rate: float = 0.05,
         n_estimators: int = 100,
@@ -451,7 +550,11 @@ class FoldSafeSmoteLGBMClassifier(BaseEstimator, ClassifierMixin):
         self.random_state = random_state
         self.device_type = device_type
         self.model_n_jobs = model_n_jobs
+        self.balance_strategy = balance_strategy
         self.smote_k_neighbors = smote_k_neighbors
+        self.scale_pos_weight = scale_pos_weight
+        self.early_stopping_rounds = early_stopping_rounds
+        self.early_stopping_validation_fraction = early_stopping_validation_fraction
         self.num_leaves = num_leaves
         self.learning_rate = learning_rate
         self.n_estimators = n_estimators
@@ -463,7 +566,58 @@ class FoldSafeSmoteLGBMClassifier(BaseEstimator, ClassifierMixin):
         self.reg_alpha = reg_alpha
         self.reg_lambda = reg_lambda
 
-    def _build_model(self):
+    def _resolve_balance_strategy(self) -> str:
+        resolved = str(self.balance_strategy).strip().lower()
+        if resolved not in {"smote", "scale_pos_weight"}:
+            raise ValueError("balance_strategy 只支持 'smote' 或 'scale_pos_weight'。")
+        return resolved
+
+    def _resolve_training_scale_pos_weight(self, y_train: pd.Series) -> float:
+        if self.scale_pos_weight is not None:
+            resolved = float(self.scale_pos_weight)
+            if resolved <= 0:
+                raise ValueError("scale_pos_weight 必须为正数。")
+            return resolved
+
+        negative_count = int((y_train == 0).sum())
+        positive_count = int((y_train == 1).sum())
+        if positive_count <= 0:
+            raise ValueError("训练数据中缺少正类样本，无法自动计算 scale_pos_weight。")
+        return float(negative_count / positive_count)
+
+    def _split_early_stopping_validation(
+        self,
+        X_df: pd.DataFrame,
+        y_series: pd.Series,
+    ) -> tuple[pd.DataFrame, pd.DataFrame, pd.Series, pd.Series]:
+        if self.early_stopping_rounds <= 0:
+            return X_df, pd.DataFrame(), y_series, pd.Series(dtype=y_series.dtype)
+
+        if not 0.0 < float(self.early_stopping_validation_fraction) < 0.5:
+            raise ValueError("early_stopping_validation_fraction 必须在 0 和 0.5 之间。")
+
+        class_counts = y_series.value_counts()
+        if len(y_series) < 10 or class_counts.min() < 2:
+            return X_df, pd.DataFrame(), y_series, pd.Series(dtype=y_series.dtype)
+
+        try:
+            X_fit, X_eval, y_fit, y_eval = train_test_split(
+                X_df,
+                y_series,
+                test_size=float(self.early_stopping_validation_fraction),
+                random_state=self.random_state,
+                stratify=y_series,
+            )
+        except ValueError:
+            return X_df, pd.DataFrame(), y_series, pd.Series(dtype=y_series.dtype)
+        return (
+            X_fit.reset_index(drop=True),
+            X_eval.reset_index(drop=True),
+            y_fit.reset_index(drop=True),
+            y_eval.reset_index(drop=True),
+        )
+
+    def _build_model(self, effective_scale_pos_weight: float = 1.0):
         validate_cuda_only_requested(self.device_type)
 
         import lightgbm as lgb
@@ -484,34 +638,74 @@ class FoldSafeSmoteLGBMClassifier(BaseEstimator, ClassifierMixin):
             min_split_gain=self.min_split_gain,
             reg_alpha=self.reg_alpha,
             reg_lambda=self.reg_lambda,
+            scale_pos_weight=effective_scale_pos_weight,
             verbosity=-1,
         )
 
     def fit(self, X: pd.DataFrame, y: pd.Series):
         if self.smote_k_neighbors <= 0:
             raise ValueError("smote_k_neighbors 必须为正整数。")
+        if self.early_stopping_rounds < 0:
+            raise ValueError("early_stopping_rounds 不能为负数。")
 
         X_df = X.copy() if isinstance(X, pd.DataFrame) else pd.DataFrame(X)
         y_series = y.copy() if isinstance(y, pd.Series) else pd.Series(y, name="target")
         y_series = y_series.reset_index(drop=True)
         X_df = X_df.reset_index(drop=True)
 
-        self.preprocessor_bundle_ = _fit_lightgbm_preprocessor(X_df)
-        X_processed = transform_lightgbm_features(X_df, self.preprocessor_bundle_)
         self.fit_class_counts_ = y_series.value_counts().sort_index().to_dict()
+        self.balance_strategy_ = self._resolve_balance_strategy()
 
-        X_resampled, y_resampled = notebook_smote_resample(
-            X_processed,
-            y_series,
-            random_state=self.random_state,
-            k_neighbors=self.smote_k_neighbors,
+        X_fit, X_eval, y_fit, y_eval = self._split_early_stopping_validation(X_df, y_series)
+        self.train_split_class_counts_ = y_fit.value_counts().sort_index().to_dict()
+        self.eval_split_class_counts_ = y_eval.value_counts().sort_index().to_dict()
+
+        self.preprocessor_bundle_ = _fit_lightgbm_preprocessor(X_fit)
+        X_fit_processed = transform_lightgbm_features(X_fit, self.preprocessor_bundle_)
+        X_eval_processed = None
+        if not X_eval.empty:
+            X_eval_processed = transform_lightgbm_features(X_eval, self.preprocessor_bundle_)
+
+        X_model_fit = X_fit_processed
+        y_model_fit = y_fit
+        self.effective_scale_pos_weight_ = 1.0
+        if self.balance_strategy_ == "smote":
+            X_model_fit, y_model_fit = notebook_smote_resample(
+                X_fit_processed,
+                y_fit,
+                random_state=self.random_state,
+                k_neighbors=self.smote_k_neighbors,
+            )
+        else:
+            self.effective_scale_pos_weight_ = self._resolve_training_scale_pos_weight(y_fit)
+
+        self.model_fit_class_counts_ = y_model_fit.value_counts().sort_index().to_dict()
+        self.resampled_class_counts_ = self.model_fit_class_counts_
+        self.used_early_stopping_ = bool(self.early_stopping_rounds > 0 and X_eval_processed is not None)
+
+        self.model_ = self._build_model(
+            effective_scale_pos_weight=self.effective_scale_pos_weight_,
         )
-        self.resampled_class_counts_ = y_resampled.value_counts().sort_index().to_dict()
+        fit_kwargs: Dict[str, Any] = {}
+        if self.used_early_stopping_:
+            import lightgbm as lgb
 
-        self.model_ = self._build_model()
-        self.model_.fit(X_resampled, y_resampled)
+            fit_kwargs = {
+                "eval_set": [(X_eval_processed, y_eval)],
+                "eval_names": ["fold_valid"],
+                "eval_metric": "auc",
+                "callbacks": [
+                    lgb.early_stopping(
+                        stopping_rounds=int(self.early_stopping_rounds),
+                        verbose=False,
+                    )
+                ],
+            }
+
+        self.model_.fit(X_model_fit, y_model_fit, **fit_kwargs)
         self.classes_ = getattr(self.model_, "classes_", np.sort(y_series.unique()))
         self.booster_ = self.model_.booster_
+        self.best_iteration_ = getattr(self.model_, "best_iteration_", None)
 
         return self
 
@@ -627,13 +821,21 @@ def build_lgbm_classifier(
     random_state: int = 42,
     device_type: str = "cuda",
     model_n_jobs: int = 1,
+    balance_strategy: str = "smote",
     smote_k_neighbors: int = 5,
+    scale_pos_weight: Optional[float] = None,
+    early_stopping_rounds: int = 100,
+    early_stopping_validation_fraction: float = 0.15,
 ):
     return FoldSafeSmoteLGBMClassifier(
         random_state=random_state,
         device_type=device_type,
         model_n_jobs=model_n_jobs,
+        balance_strategy=balance_strategy,
         smote_k_neighbors=smote_k_neighbors,
+        scale_pos_weight=scale_pos_weight,
+        early_stopping_rounds=early_stopping_rounds,
+        early_stopping_validation_fraction=early_stopping_validation_fraction,
     )
 
 
@@ -713,6 +915,15 @@ def save_lightgbm_inference_artifacts(
         "retention_time_diagnostics": estimator_preprocessor.get("retention_time_diagnostics"),
         "classes_": list(getattr(estimator, "classes_", [])),
         "classification_threshold": classification_threshold,
+        "balance_strategy": getattr(estimator, "balance_strategy_", None),
+        "effective_scale_pos_weight": getattr(estimator, "effective_scale_pos_weight_", None),
+        "early_stopping_rounds": getattr(estimator, "early_stopping_rounds", None),
+        "early_stopping_validation_fraction": getattr(
+            estimator,
+            "early_stopping_validation_fraction",
+            None,
+        ),
+        "best_iteration": getattr(estimator, "best_iteration_", None),
     }
     joblib.dump(preprocessor_bundle, preprocessor_path)
 
@@ -736,6 +947,15 @@ def save_lightgbm_inference_artifacts(
         "dataset_retention_time_diagnostics": prepared.get("retention_time_diagnostics"),
         "classes_": list(getattr(estimator, "classes_", [])),
         "classification_threshold": classification_threshold,
+        "balance_strategy": getattr(estimator, "balance_strategy_", None),
+        "effective_scale_pos_weight": getattr(estimator, "effective_scale_pos_weight_", None),
+        "early_stopping_rounds": getattr(estimator, "early_stopping_rounds", None),
+        "early_stopping_validation_fraction": getattr(
+            estimator,
+            "early_stopping_validation_fraction",
+            None,
+        ),
+        "best_iteration": getattr(estimator, "best_iteration_", None),
         "random_seed": random_seed,
         "test_size": test_size,
         "smote_k_neighbors": smote_k_neighbors,
