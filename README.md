@@ -14,7 +14,7 @@ The core of this project is a mass-spectrometry-based toxicity classifier. The r
 * **Genotoxicity Prediction**: Predicts substance genotoxicity based on mass spectrometry data.
 * **Pre-trained Model**: Includes a ready-to-use model trained on the Massbank dataset.
 * **CUDA-only Training Notebook**: LightGBM training is pinned to `device_type='cuda'` and performs a preflight check before any real training starts.
-* **Smoke Validation Script**: `check_lgbm_cuda_pipeline.py` verifies the training chain on a reduced sample instead of launching a full search.
+* **Notebook Smoke Validation**: the first section of `lightgbm/light_model.ipynb` verifies the training chain on a reduced sample before the rest of the notebook reuses the same globals.
 * **Web Interface**: Provides a simple and user-friendly frontend for making predictions.
 * **Containerized**: Includes a `Dockerfile` for quick and easy deployment using Docker.
 
@@ -36,7 +36,6 @@ The core of this project is a mass-spectrometry-based toxicity classifier. The r
 ├── static/            \# Stores static assets (CSS, JS, images)
 ├── templates/         \# Stores HTML templates
 ├── cuda_training_support.py   \# Shared CUDA-only training helpers
-├── check_lgbm_cuda_pipeline.py \# Reduced-scope training smoke test
 ├── .idea/             \# IDE configuration (can be ignored)
 ├── app.py             \# Main application backend script
 ├── Dockerfile         \# Docker configuration file
@@ -68,7 +67,7 @@ source venv/bin/activate  # On Windows: venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-For the training notebook, `lightgbm` must be a **CUDA-enabled** build. A CPU-only build is intentionally rejected during preflight and will stop the notebook / smoke script immediately.
+For the training notebook, `lightgbm` must be a **CUDA-enabled** build. A CPU-only build is intentionally rejected during preflight and will stop the notebook immediately.
 
 ### Installing CUDA LightGBM on Linux
 
@@ -113,7 +112,7 @@ Key behavior:
 
 * Training is locked to `cuda`.
 * CPU fallback is disabled on purpose.
-* The notebook defaults to a **smoke** configuration so you can validate the pipeline without launching a full search.
+* The notebook starts with a **smoke validation** block so you can validate the pipeline without launching a second entrypoint.
 * `NOTEBOOK_CONFIG` is built from environment variables, so switch modes before launching the kernel.
 
 Useful environment variables:
@@ -129,13 +128,7 @@ LGBM_MODEL_N_JOBS=1
 LGBM_SEARCH_N_JOBS=1
 ```
 
-Before running the full notebook, use the reduced-scope smoke test:
-
-```bash
-python check_lgbm_cuda_pipeline.py
-```
-
-What the smoke test covers:
+The first notebook section performs the reduced-scope smoke validation. It covers:
 
 * CSV loading
 * feature preprocessing
@@ -143,7 +136,7 @@ What the smoke test covers:
 * CUDA preflight for LightGBM
 * a reduced BayesSearchCV training loop
 
-If the installed `lightgbm` package was not compiled with CUDA support, the script and notebook will fail fast with an explicit error instead of silently falling back to CPU.
+If the installed `lightgbm` package was not compiled with CUDA support, the notebook will fail fast with an explicit error instead of silently falling back to CPU.
 
 ### 3\. Running with Docker
 

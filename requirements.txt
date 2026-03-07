@@ -11,4 +11,3 @@ matplotlib
 # Training notebook requires a CUDA-enabled LightGBM build.
 # A plain CPU-only wheel will fail the CUDA preflight on purpose.
 lightgbm
-matplotlib
