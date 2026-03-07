@@ -1,326 +1,360 @@
-from sklearnex import patch_sklearn
-patch_sklearn()
-import pandas as pd
-import numpy as np
-import joblib
-import os
-from flask import Flask, request, render_template, flash, redirect, url_for
-from werkzeug.utils import secure_filename
-from catboost import CatBoostClassifier
-import threading
 import gc
+import os
+import tempfile
+import threading
+from pathlib import Path
 
-# --- 初始化 Flask App ---
-URL_PREFIX = '/genotoxic'
+import joblib
+import lightgbm as lgb
+import numpy as np
+import pandas as pd
+from flask import Flask, flash, redirect, render_template, request, url_for
+from werkzeug.utils import secure_filename
 
-app = Flask(__name__, template_folder='templates', static_folder='static',
-            static_url_path=f"{URL_PREFIX}/static")
-app.config['UPLOAD_FOLDER'] = '/tmp'
-app.config['SECRET_KEY'] = 'supersecretkey'
-os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
+# --- Flask setup ---
+URL_PREFIX = "/genotoxic"
+BASE_DIR = Path(__file__).resolve().parent
+LGBM_ASSET_DIR = BASE_DIR / "models" / "lgbm"
+LGBM_MODEL_PATH = LGBM_ASSET_DIR / "lightgbm_model.txt"
+LGBM_PREPROCESSOR_PATH = LGBM_ASSET_DIR / "lightgbm_preprocessor.joblib"
 
-# --- 统一阈值 ---
+app = Flask(
+    __name__,
+    template_folder="templates",
+    static_folder="static",
+    static_url_path=f"{URL_PREFIX}/static",
+)
+app.config["UPLOAD_FOLDER"] = os.environ.get("UPLOAD_FOLDER", tempfile.gettempdir())
+app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY", "supersecretkey")
+Path(app.config["UPLOAD_FOLDER"]).mkdir(parents=True, exist_ok=True)
+
 PREDICTION_THRESHOLD = float(os.environ.get("PREDICTION_THRESHOLD", 0.47))
 
-# --- 模型与Scaler缓存 ---
-MODELS = {}
-SCALERS = {}
+# --- Cached runtime assets ---
+MODEL = None
+PREPROCESSOR_BUNDLE = None
 
-# --- (新增) 缓存自动释放配置 ---
+# --- Idle cache release ---
 CACHE_RELEASE_TIMER = None
 CACHE_TIMEOUT_SECONDS = int(os.environ.get("CACHE_TIMEOUT_SECONDS", 300))
-# --- 结束新增 ---
-
-# --- 核心修改：模型映射现在只包含 cb_5 ---
-MODEL_MAPPING = {
-    'cb_5': {'model': 'models/cb_best_5.cbm', 'scaler': 'models/scaler_5.joblib', 'name': 'Model 5'},
-}
-# 始终使用 Model 5
-DEFAULT_MODEL_CHOICE = 'cb_5'
 
 
-def get_model_by_choice(choice_key: str):
-    """
-    根据选择返回 CatBoost 模型对象 (从 .cbm 加载)，并缓存。
-    """
-    if choice_key not in MODEL_MAPPING:
-        raise ValueError("无效的模型选择。")
+def get_model():
+    global MODEL
 
-    if choice_key in MODELS:
-        return MODELS[choice_key]
+    if MODEL is not None:
+        return MODEL
 
-    cbm_path = MODEL_MAPPING[choice_key]['model']
+    if not LGBM_MODEL_PATH.exists():
+        raise FileNotFoundError(f"未找到 LightGBM 模型文件: {LGBM_MODEL_PATH}")
 
-    # --- 核心修改：使用 CatBoost 加载 CBM ---
-    if not os.path.exists(cbm_path):
-        raise FileNotFoundError(f"未找到 CBM 模型文件: {cbm_path}。请先运行 convert_to_cbm.py 脚本。")
-
-    try:
-        model_obj = CatBoostClassifier()  # 1. 创建一个空模型
-        model_obj.load_model(cbm_path)    # 2. 从文件加载
-
-        MODELS[choice_key] = model_obj
-        print(f"成功加载 CBM 模型: {cbm_path}")
-        return model_obj
-    except Exception as e:
-        print(f"加载 CBM 模型 {cbm_path} 失败: {e}")
-        raise e
-    # --- 结束修改 ---
+    MODEL = lgb.Booster(model_file=str(LGBM_MODEL_PATH))
+    return MODEL
 
 
-def get_scaler_by_choice(choice_key: str):
-    """
-    根据选择返回对应的标准化器（scaler），并缓存。
-    """
-    if choice_key not in MODEL_MAPPING:
-        raise ValueError("无效的模型选择。")
+def get_preprocessor_bundle():
+    global PREPROCESSOR_BUNDLE
 
-    if choice_key in SCALERS:
-        return SCALERS[choice_key]
+    if PREPROCESSOR_BUNDLE is not None:
+        return PREPROCESSOR_BUNDLE
 
-    scaler_file = MODEL_MAPPING[choice_key]['scaler']
-    if not os.path.exists(scaler_file):
-        raise FileNotFoundError(f"未找到scaler文件: {scaler_file}。")
+    if not LGBM_PREPROCESSOR_PATH.exists():
+        raise FileNotFoundError(f"未找到 LightGBM 预处理器文件: {LGBM_PREPROCESSOR_PATH}")
 
-    scaler_obj = joblib.load(scaler_file)
-    SCALERS[choice_key] = scaler_obj
-    return scaler_obj
+    PREPROCESSOR_BUNDLE = joblib.load(LGBM_PREPROCESSOR_PATH)
+    if not isinstance(PREPROCESSOR_BUNDLE, dict):
+        raise TypeError("LightGBM 预处理器资产格式无效，应为字典。")
+    return PREPROCESSOR_BUNDLE
 
-# --- (新增) 缓存自动释放函数 ---
+
 def clear_caches():
-    """(新增) 清空模型和Scaler缓存并运行垃圾回收。"""
-    global MODELS, SCALERS, CACHE_RELEASE_TIMER
+    global MODEL, PREPROCESSOR_BUNDLE, CACHE_RELEASE_TIMER
 
-    if not MODELS and not SCALERS:
-        # print("缓存已为空，无需释放。") # 调试信息
+    if MODEL is None and PREPROCESSOR_BUNDLE is None:
         return
 
-    print(f"检测到 {CACHE_TIMEOUT_SECONDS} 秒无活动，正在释放模型/scaler缓存...")
-    try:
-        MODELS.clear()
-        SCALERS.clear()
-        gc.collect() # 提示进行垃圾回收
-        CACHE_RELEASE_TIMER = None # 清空计时器
-        print("缓存已成功释放。")
-    except Exception as e:
-        print(f"释放缓存时出错: {e}")
+    print(f"检测到 {CACHE_TIMEOUT_SECONDS} 秒无活动，正在释放 LightGBM 缓存...")
+    MODEL = None
+    PREPROCESSOR_BUNDLE = None
+    CACHE_RELEASE_TIMER = None
+    gc.collect()
+    print("LightGBM 缓存已释放。")
+
 
 def reset_cache_timer():
-    """(新增) 重置缓存释放计时器。"""
     global CACHE_RELEASE_TIMER
 
-    # 如果存在旧的计时器，取消它
     if CACHE_RELEASE_TIMER:
         CACHE_RELEASE_TIMER.cancel()
 
-    # 创建并启动一个新的计时器
     CACHE_RELEASE_TIMER = threading.Timer(CACHE_TIMEOUT_SECONDS, clear_caches)
+    CACHE_RELEASE_TIMER.daemon = True
     CACHE_RELEASE_TIMER.start()
-    # print("缓存释放计时器已重置。") # 调试信息
-# --- 结束新增 ---
 
 
-# --- 工具函数：自动截断表头以上的行，并设置表头 ---
-def load_excel_with_header_cleanup(path):
+def load_excel_with_header_cleanup(path: Path) -> pd.DataFrame:
     try:
         raw = pd.read_excel(path, header=None)
-    except Exception as read_err:
-        raise ValueError(f"读取Excel失败: {read_err}")
+    except Exception as exc:
+        raise ValueError(f"读取 Excel 失败: {exc}") from exc
 
     header_idx = None
-    for i in range(len(raw)):
-        row = raw.iloc[i].astype(str).str.strip()
-        values_lower = set(v.lower() for v in row.values if v and v.lower() != 'nan')
-        if 'mass' in values_lower and 'intensity' in values_lower:
-            header_idx = i
+    for idx in range(len(raw)):
+        row = raw.iloc[idx].astype(str).str.strip()
+        values_lower = {value.lower() for value in row.values if value and value.lower() != "nan"}
+        if "mass" in values_lower and "intensity" in values_lower:
+            header_idx = idx
             break
 
-    if header_idx is not None:
-        header_row = raw.iloc[header_idx].astype(str).str.strip().tolist()
-        df = raw.iloc[header_idx + 1:].copy()
-        df.columns = header_row
-        df = df.loc[:, [c for c in df.columns if c and str(c).strip().lower() != 'nan']]
-        df = df.reset_index(drop=True)
-        return df
-    else:
-        df = pd.read_excel(path)
-        return df
+    if header_idx is None:
+        return pd.read_excel(path)
+
+    header_row = raw.iloc[header_idx].astype(str).str.strip().tolist()
+    frame = raw.iloc[header_idx + 1 :].copy()
+    frame.columns = header_row
+    frame = frame.loc[:, [column for column in frame.columns if str(column).strip().lower() != "nan"]]
+    return frame.reset_index(drop=True)
 
 
-# --- 特征提取函数 (修复：变量小写 & 优化 max 调用) ---
-def extract_features_from_df(df):
-    # ... (此函数无需修改) ...
-    ff1 = df['Mass'].astype(float).tolist()
-    ff2 = df['Intensity'].astype(float).tolist()
-    ff3 = df['rel.int.'].astype(float).tolist()
+def normalize_spectrum_columns(frame: pd.DataFrame) -> pd.DataFrame:
+    normalized = frame.rename(columns={column: str(column).strip() for column in frame.columns})
+    columns_lower = {str(column).strip().lower(): column for column in normalized.columns}
+    rename_map = {}
+    if "mass" in columns_lower:
+        rename_map[columns_lower["mass"]] = "Mass"
+    if "intensity" in columns_lower:
+        rename_map[columns_lower["intensity"]] = "Intensity"
+    return normalized.rename(columns=rename_map)
 
-    pn = len(df)
-    if pn == 0:
+
+def prepare_spectrum_dataframe(frame: pd.DataFrame) -> pd.DataFrame:
+    frame = normalize_spectrum_columns(frame)
+    if "Mass" not in frame.columns or "Intensity" not in frame.columns:
+        raise ValueError("上传的 Excel 文件必须包含 'Mass' 和 'Intensity' 列。")
+
+    spectrum = frame.loc[:, ["Mass", "Intensity"]].copy()
+    spectrum["Mass"] = pd.to_numeric(spectrum["Mass"], errors="coerce")
+    spectrum["Intensity"] = pd.to_numeric(spectrum["Intensity"], errors="coerce")
+    spectrum = spectrum.dropna(subset=["Mass", "Intensity"]).reset_index(drop=True)
+    spectrum = spectrum[spectrum["Intensity"] != 0].reset_index(drop=True)
+    if spectrum.empty:
+        raise ValueError("有效的质谱峰为空，无法继续。")
+
+    max_intensity = spectrum["Intensity"].max()
+    if pd.isna(max_intensity) or max_intensity <= 0:
+        raise ValueError("有效的强度数据为空或为非正数，无法继续。")
+
+    threshold = max_intensity * 0.03
+    spectrum = spectrum[spectrum["Intensity"] >= threshold].reset_index(drop=True)
+    if spectrum.empty:
+        raise ValueError("按 3% 最大强度阈值过滤后无有效质谱峰。")
+
+    max_value = spectrum["Intensity"].max()
+    spectrum["rel.int."] = (spectrum["Intensity"] / max_value) * 999
+    spectrum["rel.int."] = spectrum["rel.int."].clip(upper=999).round().astype(int)
+    return spectrum
+
+
+def extract_features_from_df(frame: pd.DataFrame) -> pd.DataFrame:
+    masses = frame["Mass"].astype(float).tolist()
+    intensities = frame["Intensity"].astype(float).tolist()
+    relative_intensities = frame["rel.int."].astype(float).tolist()
+
+    peak_count = len(frame)
+    if peak_count == 0:
         raise ValueError("数据处理后为空，无法提取特征。请检查输入文件。")
 
-    max_ff3 = max(ff3)
-    id_val = max_ff3 / pn
-    max_index = ff3.index(max_ff3)
-    bp_val = ff1[max_index]
-    bpp_val = bp_val - ff1[max_index - 1] if max_index > 0 else 0
-    max_ff1 = max(ff1)
-    max_index_mz = ff1.index(max_ff1)
-    max_mp_val = max_ff1 - ff1[max_index_mz - 1] if max_index_mz > 0 else 0
-    min_ff1 = min(ff1)
-    ff1_average = sum(ff1) / len(ff1)
-    ff1_bzc = np.std(ff1)
-    ff2_average = sum(ff2) / len(ff2)
-    ff2_bzc = np.std(ff2)
+    max_relative_intensity = max(relative_intensities)
+    intensity_density = max_relative_intensity / peak_count
+    base_peak_index = relative_intensities.index(max_relative_intensity)
+    base_peak = masses[base_peak_index]
+    base_peak_spacing = base_peak - masses[base_peak_index - 1] if base_peak_index > 0 else 0.0
 
-    result_dict = {
-        'PN': [pn], 'ID': [id_val], 'BP': [bp_val], 'BPP': [bpp_val],
-        'MaxM': [max_ff1], 'MaxMP': [max_mp_val], 'MinM': [min_ff1],
-        'MM': [ff1_average], 'MSD': [ff1_bzc], 'IM': [ff2_average],
-        'ISD': [ff2_bzc]
+    max_mass = max(masses)
+    max_mass_index = masses.index(max_mass)
+    max_mass_spacing = max_mass - masses[max_mass_index - 1] if max_mass_index > 0 else 0.0
+
+    result = {
+        "PN": [peak_count],
+        "ID": [intensity_density],
+        "BP": [base_peak],
+        "BPP": [base_peak_spacing],
+        "MaxM": [max_mass],
+        "MaxMP": [max_mass_spacing],
+        "MinM": [min(masses)],
+        "MM": [sum(masses) / len(masses)],
+        "MSD": [np.std(masses)],
+        "IM": [sum(intensities) / len(intensities)],
+        "ISD": [np.std(intensities)],
     }
-    return pd.DataFrame(result_dict)
+    return pd.DataFrame(result)
 
 
-def run_prediction(model, scaled_features):
-    """
-    统一预测函数 (仅 CatBoost)。
-    返回 (prob_nontoxic, prob_toxic)
-    """
-    # --- 核心修改：移除 OpenVINO 逻辑 ---
-    try:
-        # model 现在一定是 CatBoost 对象
-        proba = model.predict_proba(scaled_features)[0]
-        prob_nontoxic = float(proba[0])
-        prob_toxic = float(proba[1])
-    except (AttributeError, TypeError):
-        # 若模型不支持 predict_proba，回退为硬预测
-        prediction = model.predict(scaled_features)
+def build_raw_feature_frame(
+    spectrum_features: pd.DataFrame,
+    retention_time: float,
+    collision_energy: float,
+    precursor_type: float,
+) -> pd.DataFrame:
+    frame = spectrum_features.copy()
+    frame["RETENTION_TIME"] = retention_time
+    frame["COLLISION_ENERGY"] = collision_energy
+    frame["PRECURSOR_TYPE"] = precursor_type
+    return frame
+
+
+def transform_lightgbm_features(raw_features: pd.DataFrame, bundle: dict) -> pd.DataFrame:
+    raw_input_columns = bundle.get("raw_input_columns") or bundle.get("feature_order")
+    feature_order = bundle.get("feature_order")
+    scaler = bundle.get("scaler")
+
+    if not raw_input_columns or not feature_order or scaler is None:
+        raise ValueError("LightGBM 预处理器资产缺少必要字段。")
+
+    missing_columns = [column for column in raw_input_columns if column not in raw_features.columns]
+    if missing_columns:
+        raise KeyError(f"输入特征缺少列: {missing_columns}")
+
+    frame = raw_features.loc[:, raw_input_columns].copy()
+
+    for column in bundle.get("retention_time_cast_columns", []):
+        if column in frame.columns:
+            frame[column] = pd.to_numeric(frame[column], errors="coerce").astype("float64")
+
+    numeric_impute_values = bundle.get("numeric_impute_values", {})
+    numeric_columns = [column for column in raw_input_columns if column in numeric_impute_values]
+    for column in numeric_columns:
+        frame[column] = pd.to_numeric(frame[column], errors="coerce").fillna(numeric_impute_values[column])
+
+    continuous_features = bundle.get("continuous_features", [])
+    discrete_features = bundle.get("discrete_features", [])
+
+    if continuous_features:
+        continuous_frame = pd.DataFrame(
+            scaler.transform(frame.loc[:, continuous_features]),
+            columns=continuous_features,
+            index=frame.index,
+        )
+    else:
+        continuous_frame = pd.DataFrame(index=frame.index)
+
+    if discrete_features:
+        processed = pd.concat([continuous_frame, frame.loc[:, discrete_features]], axis=1)
+    else:
+        processed = continuous_frame
+
+    processed = processed.loc[:, feature_order].copy()
+
+    processed_feature_dtypes = bundle.get("processed_feature_dtypes", {})
+    for column, dtype_name in processed_feature_dtypes.items():
+        if column not in processed.columns:
+            continue
+        if dtype_name.startswith(("float", "int")):
+            processed[column] = processed[column].astype(dtype_name)
+
+    if processed.isna().any().any():
+        nan_columns = processed.columns[processed.isna().any()].tolist()
+        raise ValueError(f"Notebook 预处理后仍存在 NaN，涉及列: {nan_columns}")
+
+    non_numeric_columns = processed.select_dtypes(exclude=["number"]).columns.tolist()
+    if non_numeric_columns:
+        raise TypeError(f"Notebook 预处理后仍存在非数值列: {non_numeric_columns}")
+
+    return processed
+
+
+def predict_with_lightgbm(processed_features: pd.DataFrame) -> tuple[float, float]:
+    model = get_model()
+    prediction = np.asarray(model.predict(processed_features))
+
+    if prediction.ndim == 1:
         prob_toxic = float(prediction[0])
-        prob_nontoxic = 1.0 - prob_toxic
+    elif prediction.ndim == 2 and prediction.shape[1] >= 2:
+        prob_toxic = float(prediction[0, 1])
+    else:
+        raise ValueError(f"无法解析 LightGBM 输出形状: {prediction.shape}")
+
+    prob_toxic = float(np.clip(prob_toxic, 0.0, 1.0))
+    prob_nontoxic = 1.0 - prob_toxic
     return prob_nontoxic, prob_toxic
-    # --- 结束修改 ---
 
 
-# --- Flask 路由 ---
-
-# --- 兼容：旧根路径重定向到前缀路径 ---
-@app.route('/', methods=['GET'])
+@app.route("/", methods=["GET"])
 def root_redirect():
-    return redirect(url_for('index'))
+    return redirect(url_for("index"))
 
-@app.route('/predict', methods=['POST'])
+
+@app.route("/predict", methods=["POST"])
 def predict_legacy():
     return predict()
 
 
-@app.route(f"{URL_PREFIX}/", methods=['GET'])
-@app.route(f"{URL_PREFIX}", methods=['GET'])
+@app.route(f"{URL_PREFIX}/", methods=["GET"])
+@app.route(f"{URL_PREFIX}", methods=["GET"])
 def index():
-    return render_template('index.html')
+    return render_template("index.html")
 
 
-@app.route(f"{URL_PREFIX}/predict", methods=['POST'])
+@app.route(f"{URL_PREFIX}/predict", methods=["POST"])
 def predict():
-    # ... (此函数无需修改) ...
-
-    # --- (新增) 收到识别请求，重置内存释放计时器 ---
     reset_cache_timer()
-    # --- 结束新增 ---
 
-    if 'file' not in request.files:
-        flash('未找到文件部分')
-        return redirect(url_for('index'))
-    file = request.files['file']
-    if file.filename == '':
-        flash('未选择文件')
-        return redirect(url_for('index'))
+    if "file" not in request.files:
+        flash("未找到文件部分")
+        return redirect(url_for("index"))
+
+    uploaded_file = request.files["file"]
+    if uploaded_file.filename == "":
+        flash("未选择文件")
+        return redirect(url_for("index"))
+
     try:
-        retention_time = float(request.form['retention_time'])
-        collision_energy = float(request.form['collision_energy'])
-        precursor_type = int(request.form['precursor_type'])
-    except (ValueError, TypeError):
-        flash('输入的参数格式不正确，请输入数字。')
-        return redirect(url_for('index'))
+        retention_time = float(request.form["retention_time"])
+        collision_energy = float(request.form["collision_energy"])
+        precursor_type = float(request.form["precursor_type"])
+    except (KeyError, TypeError, ValueError):
+        flash("输入的参数格式不正确，请输入数字。")
+        return redirect(url_for("index"))
 
-    # --- 核心修改：硬编码使用 cb_5，移除模型选择逻辑 ---
-    model_choice = DEFAULT_MODEL_CHOICE
-    # --- 结束修改 ---
+    filename = secure_filename(uploaded_file.filename) or "upload.xlsx"
+    filepath = Path(app.config["UPLOAD_FOLDER"]) / filename
+    uploaded_file.save(filepath)
 
-    if file:
-        filename = secure_filename(file.filename)
-        filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
-        file.save(filepath)
+    try:
+        source_df = load_excel_with_header_cleanup(filepath)
+        spectrum_df = prepare_spectrum_dataframe(source_df)
+        spectrum_features = extract_features_from_df(spectrum_df)
+        raw_feature_frame = build_raw_feature_frame(
+            spectrum_features=spectrum_features,
+            retention_time=retention_time,
+            collision_energy=collision_energy,
+            precursor_type=precursor_type,
+        )
+        processed_features = transform_lightgbm_features(
+            raw_features=raw_feature_frame,
+            bundle=get_preprocessor_bundle(),
+        )
+        prob_nontoxic, prob_toxic = predict_with_lightgbm(processed_features)
 
+        result_text = "Toxic" if prob_toxic >= PREDICTION_THRESHOLD else "Nontoxic"
+        return render_template(
+            "result.html",
+            prediction=result_text,
+            proba_toxic=prob_toxic,
+            proba_nontoxic=prob_nontoxic,
+        )
+    except (ValueError, FileNotFoundError, KeyError, TypeError) as exc:
+        flash(f"处理文件时发生错误: {exc}")
+        return redirect(url_for("index"))
+    except Exception as exc:
+        flash(f"发生未知错误: {exc}")
+        return redirect(url_for("index"))
+    finally:
         try:
-            # --- 2. 数据预处理 ---
-            df = load_excel_with_header_cleanup(filepath)
-            if 'Intensity' not in df.columns or 'Mass' not in df.columns:
-                renamed = {c: str(c).strip() for c in df.columns}
-                df = df.rename(columns=renamed)
-                cols_lower = {str(c).strip().lower(): c for c in df.columns}
-                rename_map = {}
-                if 'mass' in cols_lower:
-                    rename_map[cols_lower['mass']] = 'Mass'
-                if 'intensity' in cols_lower:
-                    rename_map[cols_lower['intensity']] = 'Intensity'
-                if rename_map:
-                    df = df.rename(columns=rename_map)
-                if 'Intensity' not in df.columns or 'Mass' not in df.columns:
-                    raise ValueError("上传的Excel文件必须包含 'Intensity' 和 'Mass' 列。")
-
-            keep_cols = ['Mass', 'Intensity']
-            df = df[keep_cols].copy()
-            df['Mass'] = pd.to_numeric(df['Mass'], errors='coerce')
-            df['Intensity'] = pd.to_numeric(df['Intensity'], errors='coerce')
-            df = df.dropna(subset=['Mass', 'Intensity']).reset_index(drop=True)
-            df = df[df['Intensity'] != 0].reset_index(drop=True)
-            max_intensity = df['Intensity'].max()
-            if pd.isna(max_intensity) or max_intensity <= 0:
-                raise ValueError("有效的强度数据为空或为非正数，无法继续。")
-            threshold = max_intensity * 0.03
-            df = df[df['Intensity'] >= threshold].reset_index(drop=True)
-            max_value = df['Intensity'].max()
-            df['rel.int.'] = (df['Intensity'] / max_value) * 999
-            df['rel.int.'] = df['rel.int.'].clip(upper=999).round().astype(int)
-
-            # --- 3. 特征工程 ---
-            features_df = extract_features_from_df(df)
-            features_df['RETENTION_TIME'] = retention_time
-            features_df['COLLISION_ENERGY'] = collision_energy
-            features_df['PRECURSOR_TYPE'] = precursor_type
-            feature_order = [
-                'PN', 'ID', 'BP', 'BPP', 'MaxM', 'MaxMP', 'MinM', 'MM', 'MSD',
-                'IM', 'ISD', 'RETENTION_TIME', 'COLLISION_ENERGY', 'PRECURSOR_TYPE'
-            ]
-            features_df = features_df[feature_order]
-
-            # --- 4. 标准化和预测 ---
-            # --- 核心修改：移除 'cb_all' 逻辑 ---
-            scaler = get_scaler_by_choice(model_choice)
-            scaled_features = scaler.transform(features_df)
-            model = get_model_by_choice(model_choice)
-            prob_nontoxic, prob_toxic = run_prediction(model, scaled_features)
-            # --- 结束修改 ---
-
-            # --- 5. 返回结果 ---
-            threshold_to_use = PREDICTION_THRESHOLD
-            is_toxic = prob_toxic >= threshold_to_use
-            result_text = "Toxic" if is_toxic else "Nontoxic"
-            return render_template(
-                'result.html',
-                prediction=result_text,
-                proba_toxic=prob_toxic,
-                proba_nontoxic=prob_nontoxic
-            )
-        except (ValueError, FileNotFoundError, KeyError) as data_err:
-            flash(f"处理文件时发生错误: {data_err}")
-            return redirect(url_for('index'))
-        except Exception as unknown_err:
-            flash(f"发生未知错误: {unknown_err}")
-            return redirect(url_for('index'))
-
-    return redirect(url_for('index'))
+            filepath.unlink(missing_ok=True)
+        except Exception:
+            pass
 
 
-if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000, debug=True)
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5000, debug=True)
