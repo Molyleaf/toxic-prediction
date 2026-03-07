@@ -1,93 +1,190 @@
-# Toxic-Prediction: Genotoxicity Prediction Model
+# Toxic-Prediction 项目说明
 
-This is a machine learning project for predicting the genotoxicity of chemical substances from Massbank-derived features. The repository includes a pre-trained inference model, a web frontend, and a CUDA-only LightGBM training notebook.
+本项目包含两条相互独立的能力链路：
 
-## Overview
+- Web 推理链路：`app.py` 提供基于 Flask 的网页服务，当前使用仓库内现成的 CatBoost 推理模型。
+- CUDA 训练链路：`lightgbm/light_model.ipynb` 负责训练基于质谱特征的 LightGBM 二分类模型，并强制使用 `device_type='cuda'`。
 
-The core of this project is a mass-spectrometry-based toxicity classifier. The repository contains two separate paths:
+当前仓库已经将 LightGBM 训练流程统一为单一路径：
 
-* **Inference path**: a Flask web application that serves a pre-trained CatBoost model.
-* **Training path**: a LightGBM notebook under `lightgbm/light_model.ipynb` that now runs in **CUDA-only** mode and refuses any silent CPU fallback.
+- 只在每个交叉验证训练折内部执行 Borderline-SMOTE 增样。
+- `scale_pos_weight` 只按“重采样后的新标签分布”自动计算。
+- 外层验证集、OOF 与最终测试集始终保持原始真实分布。
+- 阈值选择直接基于 CV/OOF。
+- 模型输出后会进行严格的概率校准，并把校准器一起导出。
 
-## ✨ Features
+## 目录结构
 
-* **Genotoxicity Prediction**: Predicts substance genotoxicity based on mass spectrometry data.
-* **Pre-trained Model**: Includes a ready-to-use model trained on the Massbank dataset.
-* **CUDA-only Training Notebook**: LightGBM training is pinned to `device_type='cuda'` and performs a preflight check before any real training starts.
-* **Leak-free CV Pipeline**: missing-value filling, scaling, and class balancing are learned inside each cross-validation training fold instead of before BayesSearchCV.
-* **Fold-internal Early Stopping**: each training fold reserves its own inner validation split for LightGBM early stopping without leaking outer-fold validation data.
-* **Balancing Strategy A/B**: the notebook compares `smote` and `scale_pos_weight` under the same search space, then selects the final strategy by CV AUC.
-* **Notebook-first Training Flow**: the notebook is organized into config/imports, pre-training diagnostics, A/B model selection, and OOF-based threshold calibration.
-* **Robust `RETENTION_TIME` Cleaning**: multi-value text such as `17.9 and 18.5` is parsed into a single numeric value instead of being dropped as `NaN`.
-* **Notebook Progress Bar**: BayesSearchCV progress is shown in the notebook through `tqdm.auto`.
-* **Native LightGBM Export**: the best trained booster is saved to `models/lightgbm_cuda_model.txt`.
-* **Threshold-aware Inference Bundle**: preprocessing state, selected classification threshold, and training manifest metadata are saved alongside the model.
-* **Web Interface**: Provides a simple and user-friendly frontend for making predictions.
-* **Containerized**: Includes a `Dockerfile` for quick and easy deployment using Docker.
-
-## 🚀 Tech Stack
-
-* **Backend**: Python (Inferred from `app.py` and `requirements.txt`, likely Flask / FastAPI)
-* **Frontend**: HTML, CSS, JavaScript (Located in `static` and `templates`)
-* **Training Model**: LightGBM (`lightgbm/light_model.ipynb`, CUDA-only)
-* **Inference Model**: CatBoost (`models/`)
-* **Deployment**: Docker
-
-## 📂 Project Structure
-
-```
-
+```text
 .
-├── lightgbm/          \# Training notebook and training dataset
-├── models/            \# Stores pre-trained inference model files
-├── static/            \# Stores static assets (CSS, JS, images)
-├── templates/         \# Stores HTML templates
-├── cuda_training_support.py   \# Shared CUDA-only training helpers
-├── .idea/             \# IDE configuration (can be ignored)
-├── app.py             \# Main application backend script
-├── Dockerfile         \# Docker configuration file
-├── README.md          \# This README file
-└── requirements.txt   \# Python dependency list
-
-````
-
-## 🛠️ Getting Started
-
-### 1. Local Setup (Virtual Environment Recommended)
-
-**a. Clone the repository**
-```bash
-git clone [https://github.com/Molyleaf/toxic-prediction.git](https://github.com/Molyleaf/toxic-prediction.git)
-cd toxic-prediction
-````
-
-**b. (Optional) Create and activate a virtual environment**
-
-```bash
-python -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
+├── app.py                          # Flask Web 服务，当前加载 CatBoost 推理模型
+├── cuda_training_support.py        # LightGBM CUDA 训练辅助模块
+├── lightgbm/
+│   ├── light_model.ipynb           # CUDA-only 训练 notebook
+│   └── 质谱数据汇总_处理后后后2.csv   # 训练数据
+├── models/                         # 已保存的推理模型与训练输出
+├── static/                         # 前端静态资源
+├── templates/                      # 前端模板
+├── requirements.txt                # Python 依赖
+└── Dockerfile                      # Web 服务容器化配置
 ```
 
-**c. Install dependencies**
+## 训练链路的当前设计
+
+### 1. 类别不平衡处理
+
+训练链路不再保留 `smote` / `scale_pos_weight` 两条独立路径，也不再跑两套搜索空间。
+
+现在固定采用下面的顺序：
+
+1. 在当前交叉验证训练折内部重新学习缺失值填充与标准化。
+2. 再从该训练折中切出一小块 early stopping 验证集，这块验证集不参与任何重采样。
+3. 只对该折的训练子集做 Borderline-SMOTE 增样，用来扩训练样本量，尽量减少高维空间中的跨界插值风险。
+4. 基于 Borderline-SMOTE 之后的新标签分布自动计算 `scale_pos_weight`。
+5. 用原始、未污染的外层验证集做交叉验证评分。
+
+这意味着：
+
+- 不会先对全量数据做 SMOTE 再切 Fold。
+- 不会再使用原始训练集比例去设置 `scale_pos_weight`。
+- `scale_pos_weight` 才是类别差值的最终平衡手段，SMOTE 只负责把训练集撑大到更有利于学习的规模。
+
+### 2. 超参数搜索方向
+
+新的搜索范围优先扩三件事：
+
+- 树结构容量
+- boosting 长度与速度
+- 分裂门槛
+
+而不是先把 L1/L2 正则大幅抬高。
+
+Notebook 顶部默认搜索空间如下：
+
+```python
+NOTEBOOK_LGBM_SEARCH_SPACES = {
+    "num_leaves": Integer(48, 127),
+    "learning_rate": Real(8e-3, 3e-2, prior="log-uniform"),
+    "n_estimators": Integer(2500, 6000),
+    "max_depth": Categorical([6, 7, 8, 9]),
+    "subsample": Real(0.80, 1.00),
+    "colsample_bytree": Real(0.80, 1.00),
+    "min_child_samples": Integer(60, 160),
+    "min_split_gain": Real(0.08, 0.60, prior="log-uniform"),
+    "reg_alpha": Real(5e-2, 1.5, prior="log-uniform"),
+    "reg_lambda": Real(2.0, 20.0, prior="log-uniform"),
+}
+```
+
+同时默认还做了这些调整：
+
+- `NOTEBOOK_BAYES_N_ITER = 48`
+- `NOTEBOOK_EARLY_STOPPING_ROUNDS = 300`
+- `NOTEBOOK_INITIAL_THRESHOLD = 0.42`
+
+### 3. 阈值与概率校准
+
+训练流程现在明确区分三件事：
+
+- 选参：看 CV AUC
+- 阈值：看训练集 OOF 上的校准后概率
+- 最终泛化表现：看独立测试集
+
+实际顺序如下：
+
+1. `BayesSearchCV` 找到最优超参数。
+2. 用同一套最佳参数重新跑一遍训练集 OOF，收集每个样本的折外原始概率。
+3. 在 OOF 原始概率上拟合概率校准器。
+4. 用校准后的 OOF 概率进行阈值探测与选择。
+5. 再把该校准器应用到最终 refit 模型的输出上，对测试集做最终评估。
+
+默认校准策略：
+
+- 首选 `Isotonic Regression`
+- 如果 OOF 分数离散度或样本量不够，会自动回退到 `Platt Scaling`
+
+导出的推理资产里会同时保存：
+
+- 预处理状态
+- 概率校准器
+- 阈值选择元数据
+- 最终分类阈值
+
+### 4. RTX 4090 训练利用率
+
+LightGBM 的 CUDA 训练并不是只有 GPU 在工作，CPU 仍然负责一部分直方图构建、数据调度和喂数。
+
+当前默认策略：
+
+- `BayesSearchCV` worker 固定为 `1`，避免一张卡被多个外层搜索 worker 抢占。
+- 单个 LightGBM 模型的 `model_n_jobs` 默认根据 CPU 核数自动给到 `4 ~ 16` 个线程，降低 GPU 因 CPU 单线程喂数不足而空转的概率。
+- 搜索空间本身也扩大了树容量和 boosting 长度，让 GPU 每轮训练有更稳定的工作量。
+
+## Notebook 使用方式
+
+训练 notebook 在 `lightgbm/light_model.ipynb`。
+
+建议按顺序运行四个代码单元：
+
+1. 导入依赖、加载 `cuda_training_support.py`、设置全局训练参数。
+2. 读取 CSV、清洗 `RETENTION_TIME`、切分训练集和测试集、做 CUDA 预检。
+3. 跑单路径 `BayesSearchCV`，得到最终 `best_estimator_`。
+4. 生成 OOF 原始概率、做概率校准、在校准后的 OOF 上选阈值、评估测试集、导出模型资产。
+
+### Notebook 顶部关键参数
+
+```python
+NOTEBOOK_RANDOM_SEED = 114514
+NOTEBOOK_TEST_SIZE = 0.15
+NOTEBOOK_BAYES_N_ITER = 48
+NOTEBOOK_CV_FOLDS = 5
+NOTEBOOK_MODEL_N_JOBS = cuda_training_support.resolve_recommended_model_n_jobs()
+NOTEBOOK_SEARCH_N_JOBS = 1
+NOTEBOOK_SMOTE_K_NEIGHBORS = 3
+NOTEBOOK_SMOTE_SAMPLING_STRATEGY = 0.75
+NOTEBOOK_EARLY_STOPPING_ROUNDS = 300
+NOTEBOOK_EARLY_STOPPING_VALIDATION_FRACTION = 0.15
+NOTEBOOK_BAYES_SCORING = "roc_auc"
+NOTEBOOK_INITIAL_THRESHOLD = 0.42
+NOTEBOOK_THRESHOLD_SELECTION_METRIC = "F1"
+NOTEBOOK_CALIBRATION_METHOD = "isotonic"
+```
+
+## 导出产物
+
+训练完成后会输出三个文件：
+
+- `models/lightgbm_cuda_model.txt`
+  - 原生 LightGBM booster 文件
+- `models/lightgbm_cuda_preprocessor.joblib`
+  - 预处理器、`RETENTION_TIME` 清洗信息、概率校准器、阈值元数据、重采样信息
+- `models/lightgbm_cuda_inference_assets.json`
+  - 适合人工查看的清单文件，记录模型路径、阈值、概率校准信息、重采样信息与训练配置
+
+## 环境安装
+
+### 1. 安装 Python 依赖
 
 ```bash
 pip install -r requirements.txt
 ```
 
-For the training notebook, `lightgbm` must be a **CUDA-enabled** build. A CPU-only build is intentionally rejected during preflight and will stop the notebook immediately.
+训练 notebook 现在额外依赖 `imbalanced-learn`，用于折内 Borderline-SMOTE。
 
-### Installing CUDA LightGBM on Linux
+### 2. 安装 CUDA 版 LightGBM
 
-The notebook uses `device_type='cuda'`, which means the plain Windows wheel is not sufficient. Keep the web app on Windows if you want, but move the training notebook to Linux or WSL2 and reinstall LightGBM from source with CUDA enabled.
+项目训练链路固定要求 `device_type='cuda'`，不会静默回退到 CPU。
 
-Recommended Python package install:
+如果你在 Windows 上开发 Web 服务，建议把训练 notebook 放到 Linux 或 WSL2 环境执行。
+
+推荐安装方式：
 
 ```bash
 pip uninstall -y lightgbm
 pip install lightgbm --no-binary lightgbm --config-settings=cmake.define.USE_CUDA=ON
 ```
 
-If you prefer compiling LightGBM first:
+如果需要先编译源码：
 
 ```bash
 git clone --recursive https://github.com/microsoft/LightGBM
@@ -96,145 +193,35 @@ cmake -B build -S . -DUSE_CUDA=ON
 cmake --build build -j4
 ```
 
-Prerequisites from the official LightGBM installation guide:
+至少需要：
 
-* Linux
-* CMake 3.28 or newer
-* GCC or Clang
-* CUDA Toolkit 11.0 or newer
+- Linux 或 WSL2
+- CMake 3.28 或更高版本
+- GCC 或 Clang
+- CUDA Toolkit 11.0 或更新版本
 
-**d. Run the application**
+## Web 服务运行
+
+如果只需要启动现有网页推理服务：
 
 ```bash
 python app.py
 ```
 
-After launching, open your browser and navigate to `http://127.0.0.1:5000` (or the port specified in the console) to use the application.
+默认会在本地启动 Flask 服务，并使用仓库内已有的 CatBoost 推理模型。
 
-### 2. CUDA Training Notebook
+## Docker
 
-The training notebook is located at `lightgbm/light_model.ipynb`.
-
-Key behavior:
-
-* Training is locked to `cuda`.
-* CPU fallback is disabled on purpose.
-* The first code cell centralizes imports, path fixes, `NOTEBOOK_*` globals, the commented LightGBM search space, the A/B balancing setup, and the output paths for all inference artifacts.
-* `NOTEBOOK_CONFIG` is built from those globals, so edit that first cell and rerun the notebook from the top when you want to change training behavior.
-* The second code cell runs data loading, `RETENTION_TIME` cleaning diagnostics, and train/test splitting before any fitting starts.
-* The third code cell runs two BayesSearchCV passes, one for `smote` and one for `scale_pos_weight`, shows a `tqdm.auto` progress bar for each strategy, and selects the final strategy by CV AUC.
-* The fourth code cell uses training-set OOF probabilities to probe thresholds, selects the final classification threshold, evaluates the untouched hold-out test set, and then saves the full inference artifact bundle.
-* Missing-value filling, scaling, class balancing, and fold-internal early stopping all happen inside the estimator `fit`, so each CV training fold learns its own preprocessing state, its own inner validation split, and its own balancing state independently.
-
-Main globals in the first notebook cell:
-
-```python
-# NOTEBOOK_RANDOM_SEED: controls the random seed for the split, BayesSearchCV, SMOTE, early stopping, and LightGBM.
-NOTEBOOK_RANDOM_SEED = 114514
-# NOTEBOOK_TEST_SIZE: fraction reserved for the final hold-out test set.
-NOTEBOOK_TEST_SIZE = 0.25
-# NOTEBOOK_BAYES_N_ITER: number of candidate parameter sets sampled by BayesSearchCV.
-NOTEBOOK_BAYES_N_ITER = 48
-# NOTEBOOK_CV_FOLDS: number of stratified cross-validation folds.
-NOTEBOOK_CV_FOLDS = 5
-# NOTEBOOK_MODEL_N_JOBS: thread count used inside a single LightGBM fit.
-NOTEBOOK_MODEL_N_JOBS = 1
-# NOTEBOOK_SEARCH_N_JOBS: BayesSearchCV worker count; `1` is safer for a shared GPU.
-NOTEBOOK_SEARCH_N_JOBS = 1
-# NOTEBOOK_SMOTE_K_NEIGHBORS: nearest-neighbor count used by fold-local SMOTE when strategy='smote'.
-NOTEBOOK_SMOTE_K_NEIGHBORS = 3
-# NOTEBOOK_SCALE_POS_WEIGHT: positive-class weight used when strategy='scale_pos_weight'; None means auto-compute inside each fold.
-NOTEBOOK_SCALE_POS_WEIGHT = None
-# NOTEBOOK_EARLY_STOPPING_ROUNDS: fold-internal early stopping patience.
-NOTEBOOK_EARLY_STOPPING_ROUNDS = 100
-# NOTEBOOK_EARLY_STOPPING_VALIDATION_FRACTION: validation share carved out inside each training fold for early stopping.
-NOTEBOOK_EARLY_STOPPING_VALIDATION_FRACTION = 0.15
-# NOTEBOOK_BALANCE_STRATEGIES: balancing strategies compared in the A/B pass.
-NOTEBOOK_BALANCE_STRATEGIES = ("smote", "scale_pos_weight")
-# NOTEBOOK_BAYES_SCORING: model-selection metric used by BayesSearchCV.
-NOTEBOOK_BAYES_SCORING = "roc_auc"
-# NOTEBOOK_BAYES_VERBOSE: BayesSearchCV verbosity level.
-NOTEBOOK_BAYES_VERBOSE = 0
-# NOTEBOOK_THRESHOLD_SELECTION_METRIC: metric used to choose the final classification threshold from OOF probabilities.
-NOTEBOOK_THRESHOLD_SELECTION_METRIC = "F1"
-```
-
-`NOTEBOOK_THRESHOLD_PROBE_THRESHOLDS` is also defined in the same cell and defaults to a dense grid from `0.30` to `0.70`.
-
-The same top cell also defines `NOTEBOOK_LGBM_SEARCH_SPACES`, with every search dimension annotated in-place:
-
-```python
-NOTEBOOK_LGBM_SEARCH_SPACES = {
-    "num_leaves": Integer(24, 63),  # allow the search to go beyond the previous edge-hitting optimum.
-    "learning_rate": Real(3e-3, 1.0e-2, prior="log-uniform"),  # keep the step size small and let early stopping decide the usable length.
-    "n_estimators": Integer(1200, 3200),  # more boosting rounds, truncated by fold-internal early stopping.
-    "max_depth": Categorical([5, 6, 7]),  # permit a slightly deeper tree while still capping structure.
-    "subsample": Real(0.65, 0.90),  # row sampling ratio per tree.
-    "colsample_bytree": Real(0.65, 0.90),  # feature sampling ratio per tree.
-    "min_child_samples": Integer(80, 220),  # raise the lower bound to keep leaves more conservative.
-    "min_split_gain": Real(0.02, 0.20, prior="log-uniform"),  # raise the lower bound to discourage marginal splits.
-    "reg_alpha": Real(0.3, 6.0, prior="log-uniform"),  # moderate L1 regularization.
-    "reg_lambda": Real(8.0, 40.0, prior="log-uniform"),  # moderate L2 regularization.
-}
-```
-
-`RETENTION_TIME` handling is also centralized: plain numeric values stay unchanged, multi-value text rows are reduced to the mean of all numeric tokens, and truly missing values remain missing until they are imputed with the training-fold mode.
-
-The notebook training flow covers:
-
-* CSV loading
-* `RETENTION_TIME` normalization and diagnostics
-* training diagnostics before fitting
-* fold-local preprocessing learned independently inside every CV training fold
-* fold-local early stopping validation split carved out inside each training fold
-* fold-local A/B comparison between `smote` and `scale_pos_weight`
-* fold-local SMOTE replacement applied only when the current strategy is `smote`
-* fold-local `scale_pos_weight` auto-computation applied only when the current strategy is `scale_pos_weight`
-* CUDA preflight for LightGBM
-* a full BayesSearchCV training loop with the wider-but-still-regularized search space
-* notebook progress tracking through `tqdm.auto`
-* training-set OOF threshold probing before any artifact export
-* exporting the best booster to `models/lightgbm_cuda_model.txt`
-* exporting preprocessing state to `models/lightgbm_cuda_preprocessor.joblib`
-* exporting an inference manifest to `models/lightgbm_cuda_inference_assets.json`
-
-The downstream inference bundle consists of:
-
-* `models/lightgbm_cuda_model.txt`: native LightGBM booster
-* `models/lightgbm_cuda_preprocessor.joblib`: fitted scaler, fill values, feature grouping, feature order, `RETENTION_TIME` cleaning metadata, balancing metadata, and the selected classification threshold
-* `models/lightgbm_cuda_inference_assets.json`: human-readable manifest of the saved inference assets, including threshold and early-stopping metadata
-
-If the installed `lightgbm` package was not compiled with CUDA support, the notebook will fail fast with an explicit error instead of silently falling back to CPU.
-
-### 3\. Running with Docker
-
-If you have Docker installed, you can run the project with these commands.
-
-**a. Build the Docker image**
+如果只运行 Web 服务，也可以使用 Docker：
 
 ```bash
 docker build -t toxic-prediction .
-```
-
-**b. Run the Docker container**
-
-```bash
-# This maps port 5000 on your host to port 5000 in the container
 docker run -p 5000:5000 toxic-prediction
 ```
 
-The application will be available at `http://localhost:5000`.
+## 注意事项
 
-## 🤝 Contributing
-
-Contributions are welcome\! If you have suggestions or want to contribute code, please follow these steps:
-
-1.  Fork the Project
-2.  Create your Feature Branch (`git checkout -b feature/AmazingFeature`)
-3.  Commit your Changes (`git commit -m 'Add some AmazingFeature'`)
-4.  Push to the Branch (`git push origin feature/AmazingFeature`)
-5.  Open a Pull Request
-
-## 📄 License
-
-This project is licensed under the MIT License.
+- 训练 notebook 与 Web 推理服务使用的模型不是同一条链路；Web 端当前仍然加载 CatBoost 产物。
+- 训练 notebook 会在启动时先做 CUDA 预检；如果当前 `lightgbm` 不是 CUDA 构建，会直接报错退出。
+- 阈值选择和概率校准都只参考训练集 OOF，不会使用测试集反向调参。
+- 如果想修改训练行为，优先改 notebook 顶部的 `NOTEBOOK_*` 全局变量，再从头重新运行整个 notebook。

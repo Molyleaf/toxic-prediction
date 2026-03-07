@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import platform
 import re
 from dataclasses import dataclass
@@ -11,9 +12,12 @@ import joblib
 import numpy as np
 import pandas as pd
 from sklearn.base import BaseEstimator, ClassifierMixin
+from sklearn.isotonic import IsotonicRegression
+from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import (
     accuracy_score,
     balanced_accuracy_score,
+    brier_score_loss,
     confusion_matrix,
     f1_score,
     precision_score,
@@ -21,7 +25,6 @@ from sklearn.metrics import (
     roc_auc_score,
 )
 from sklearn.model_selection import train_test_split
-from sklearn.neighbors import NearestNeighbors
 from sklearn.preprocessing import StandardScaler
 from sklearn.utils.validation import check_is_fitted
 
@@ -40,6 +43,12 @@ LIGHTGBM_CUDA_SOURCE_BUILD_COMMANDS = (
     "cmake -B build -S . -DUSE_CUDA=ON\n"
     "cmake --build build -j4"
 )
+DEFAULT_SMOTE_SAMPLING_STRATEGY = 0.75
+DEFAULT_INITIAL_THRESHOLD = 0.42
+DEFAULT_CALIBRATION_METHOD = "isotonic"
+DEFAULT_BORDERLINE_SMOTE_KIND = "borderline-1"
+DEFAULT_LGBM_MAX_BIN = 255
+ARTIFACTS_VERSION = 2
 
 
 @dataclass(frozen=True)
@@ -51,8 +60,11 @@ class NotebookRunConfig:
     model_n_jobs: int
     search_n_jobs: int
     smote_k_neighbors: int
+    smote_sampling_strategy: float
     early_stopping_rounds: int
     early_stopping_validation_fraction: float
+    calibration_method: str
+    initial_threshold: float
 
 
 def format_notebook_run_summary(
@@ -67,12 +79,40 @@ def format_notebook_run_summary(
         f"模型 n_jobs: {config.model_n_jobs}",
         f"搜索 n_jobs: {config.search_n_jobs}",
         f"SMOTE k_neighbors: {config.smote_k_neighbors}",
+        f"Borderline-SMOTE 目标少数类/多数类比例: {config.smote_sampling_strategy}",
         f"折内 early stopping rounds: {config.early_stopping_rounds}",
         f"折内 early stopping 验证集比例: {config.early_stopping_validation_fraction}",
+        f"概率校准方法: {config.calibration_method}",
+        f"初始阈值: {config.initial_threshold}",
     ]
     if data_path is not None:
         lines.insert(1, f"数据文件: {data_path}")
     return "\n".join(lines)
+
+
+def resolve_recommended_model_n_jobs(explicit_n_jobs: Optional[int] = None) -> int:
+    if explicit_n_jobs is not None:
+        resolved = int(explicit_n_jobs)
+        if resolved <= 0:
+            raise ValueError("model_n_jobs 必须为正整数。")
+        return resolved
+
+    cpu_count = os.cpu_count() or 8
+    # LightGBM 的 CUDA 训练仍依赖 CPU 侧做直方图构建与数据调度；
+    # 默认给到 4~16 个线程，避免 4090 被单线程喂数拖慢。
+    return int(max(4, min(16, cpu_count)))
+
+
+def normalize_probability_calibration_method(method: Optional[str]) -> str:
+    resolved = str(DEFAULT_CALIBRATION_METHOD if method is None else method).strip().lower()
+    alias_map = {
+        "sigmoid": "platt",
+        "logistic": "platt",
+    }
+    resolved = alias_map.get(resolved, resolved)
+    if resolved not in {"isotonic", "platt", "auto"}:
+        raise ValueError("calibration_method 只支持 'isotonic'、'platt' 或 'auto'。")
+    return resolved
 
 
 def get_lightgbm_cuda_installation_notes() -> str:
@@ -125,25 +165,37 @@ def build_notebook_run_config(
     model_n_jobs: Optional[int] = None,
     search_n_jobs: Optional[int] = None,
     smote_k_neighbors: Optional[int] = None,
+    smote_sampling_strategy: Optional[float] = None,
     early_stopping_rounds: Optional[int] = None,
     early_stopping_validation_fraction: Optional[float] = None,
+    calibration_method: Optional[str] = None,
+    initial_threshold: Optional[float] = None,
 ) -> NotebookRunConfig:
     resolved_random_seed = int(42 if random_seed is None else random_seed)
     resolved_test_size = float(0.2 if test_size is None else test_size)
-    resolved_bayes_n_iter = int(24 if bayes_n_iter is None else bayes_n_iter)
+    resolved_bayes_n_iter = int(48 if bayes_n_iter is None else bayes_n_iter)
     resolved_cv_folds = int(5 if cv_folds is None else cv_folds)
 
-    # GPU 训练与交叉验证并发通常会争抢同一张卡，这里默认串行执行搜索。
-    resolved_model_n_jobs = int(1 if model_n_jobs is None else model_n_jobs)
+    # GPU 搜索仍保持串行，避免多个 worker 同时争抢同一张卡。
+    resolved_model_n_jobs = resolve_recommended_model_n_jobs(model_n_jobs)
     resolved_search_n_jobs = int(1 if search_n_jobs is None else search_n_jobs)
     resolved_smote_k_neighbors = int(5 if smote_k_neighbors is None else smote_k_neighbors)
+    resolved_smote_sampling_strategy = float(
+        DEFAULT_SMOTE_SAMPLING_STRATEGY
+        if smote_sampling_strategy is None
+        else smote_sampling_strategy
+    )
     resolved_early_stopping_rounds = int(
-        100 if early_stopping_rounds is None else early_stopping_rounds
+        300 if early_stopping_rounds is None else early_stopping_rounds
     )
     resolved_early_stopping_validation_fraction = float(
         0.15
         if early_stopping_validation_fraction is None
         else early_stopping_validation_fraction
+    )
+    resolved_calibration_method = normalize_probability_calibration_method(calibration_method)
+    resolved_initial_threshold = float(
+        DEFAULT_INITIAL_THRESHOLD if initial_threshold is None else initial_threshold
     )
 
     if resolved_bayes_n_iter <= 0:
@@ -152,14 +204,18 @@ def build_notebook_run_config(
         raise ValueError("cv_folds 至少为 2。")
     if not 0.0 < resolved_test_size < 1.0:
         raise ValueError("test_size 必须在 0 和 1 之间。")
-    if resolved_model_n_jobs <= 0 or resolved_search_n_jobs <= 0:
-        raise ValueError("model_n_jobs 和 search_n_jobs 必须为正整数。")
+    if resolved_search_n_jobs <= 0:
+        raise ValueError("search_n_jobs 必须为正整数。")
     if resolved_smote_k_neighbors <= 0:
         raise ValueError("smote_k_neighbors 必须为正整数。")
+    if not 0.0 < resolved_smote_sampling_strategy <= 1.0:
+        raise ValueError("smote_sampling_strategy 必须在 0 和 1 之间。")
     if resolved_early_stopping_rounds < 0:
         raise ValueError("early_stopping_rounds 不能为负数。")
     if not 0.0 < resolved_early_stopping_validation_fraction < 0.5:
         raise ValueError("early_stopping_validation_fraction 必须在 0 和 0.5 之间。")
+    if not 0.0 < resolved_initial_threshold < 1.0:
+        raise ValueError("initial_threshold 必须在 0 和 1 之间。")
 
     return NotebookRunConfig(
         bayes_n_iter=resolved_bayes_n_iter,
@@ -169,8 +225,11 @@ def build_notebook_run_config(
         model_n_jobs=resolved_model_n_jobs,
         search_n_jobs=resolved_search_n_jobs,
         smote_k_neighbors=resolved_smote_k_neighbors,
+        smote_sampling_strategy=resolved_smote_sampling_strategy,
         early_stopping_rounds=resolved_early_stopping_rounds,
         early_stopping_validation_fraction=resolved_early_stopping_validation_fraction,
+        calibration_method=resolved_calibration_method,
+        initial_threshold=resolved_initial_threshold,
     )
 
 
@@ -354,84 +413,115 @@ def transform_lightgbm_features(
     return processed.reset_index(drop=True)
 
 
-def notebook_smote_resample(
+def summarize_binary_class_counts(
+    y: pd.Series | np.ndarray | list[Any],
+) -> Dict[int, int]:
+    y_series = y.copy() if isinstance(y, pd.Series) else pd.Series(y, name="target")
+    counts = y_series.value_counts().sort_index()
+    return {int(label): int(count) for label, count in counts.items()}
+
+
+def compute_positive_class_ratio(
+    y: pd.Series | np.ndarray | list[Any],
+) -> float:
+    class_counts = summarize_binary_class_counts(y)
+    negative_count = int(class_counts.get(0, 0))
+    positive_count = int(class_counts.get(1, 0))
+    if negative_count <= 0:
+        return 1.0
+    return float(positive_count / negative_count)
+
+
+def compute_scale_pos_weight_from_labels(
+    y: pd.Series | np.ndarray | list[Any],
+) -> float:
+    class_counts = summarize_binary_class_counts(y)
+    negative_count = int(class_counts.get(0, 0))
+    positive_count = int(class_counts.get(1, 0))
+    if positive_count <= 0:
+        raise ValueError("训练数据中缺少正类样本，无法自动计算 scale_pos_weight。")
+    return float(negative_count / positive_count)
+
+
+def resample_training_fold_with_borderline_smote(
     X: pd.DataFrame,
     y: pd.Series,
     random_state: int = 42,
     k_neighbors: int = 5,
-) -> tuple[pd.DataFrame, pd.Series]:
+    sampling_strategy: float = DEFAULT_SMOTE_SAMPLING_STRATEGY,
+) -> tuple[pd.DataFrame, pd.Series, Dict[str, Any]]:
     X_df = X.copy() if isinstance(X, pd.DataFrame) else pd.DataFrame(X)
     y_series = y.copy() if isinstance(y, pd.Series) else pd.Series(y, name="target")
     y_series = y_series.reset_index(drop=True)
     X_df = X_df.reset_index(drop=True)
 
-    class_counts = y_series.value_counts()
-    target_count = int(class_counts.max())
-    rng = np.random.default_rng(random_state)
+    if X_df.select_dtypes(exclude=[np.number]).shape[1] > 0:
+        raise ValueError("当前 Borderline-SMOTE 路径要求输入特征全部为数值列。")
 
-    numeric_columns = X_df.select_dtypes(include=[np.number]).columns.tolist()
-    categorical_columns = [col for col in X_df.columns if col not in numeric_columns]
+    class_counts = summarize_binary_class_counts(y_series)
+    minority_count = int(min(class_counts.values(), default=0))
+    majority_count = int(max(class_counts.values(), default=0))
+    minority_ratio = float(minority_count / majority_count) if majority_count > 0 else 1.0
+    diagnostics = {
+        "resampler": "BorderlineSMOTE",
+        "resampler_kind": DEFAULT_BORDERLINE_SMOTE_KIND,
+        "sampling_strategy_target": float(sampling_strategy),
+        "input_class_counts": class_counts,
+        "output_class_counts": class_counts,
+        "positive_ratio_before": compute_positive_class_ratio(y_series),
+        "positive_ratio_after": compute_positive_class_ratio(y_series),
+        "applied": False,
+        "skip_reason": None,
+    }
 
-    generated_batches = []
-    generated_labels = []
+    if len(class_counts) < 2:
+        diagnostics["skip_reason"] = "单类训练折无法执行重采样。"
+        return X_df, y_series, diagnostics
 
-    for class_label, class_count in class_counts.items():
-        n_to_generate = target_count - int(class_count)
-        if n_to_generate <= 0:
-            continue
+    if minority_count <= 1:
+        diagnostics["skip_reason"] = "少数类样本不足 2 条，无法执行 Borderline-SMOTE。"
+        return X_df, y_series, diagnostics
 
-        class_rows = X_df.loc[y_series == class_label].reset_index(drop=True)
-        if len(class_rows) == 1:
-            synthetic = pd.concat([class_rows] * n_to_generate, ignore_index=True)
-            neighbor_rows = synthetic.copy()
-        else:
-            base_indices = rng.integers(0, len(class_rows), size=n_to_generate)
-            base_rows = class_rows.iloc[base_indices].reset_index(drop=True)
+    if minority_ratio >= float(sampling_strategy):
+        diagnostics["skip_reason"] = "当前训练折的少数类占比已不低于目标采样比例。"
+        return X_df, y_series, diagnostics
 
-            if numeric_columns:
-                n_neighbors = min(k_neighbors + 1, len(class_rows))
-                nn = NearestNeighbors(n_neighbors=n_neighbors)
-                nn.fit(class_rows[numeric_columns])
-                neighbor_matrix = nn.kneighbors(
-                    class_rows[numeric_columns],
-                    return_distance=False,
-                )[:, 1:]
-                if neighbor_matrix.shape[1] == 0:
-                    neighbor_indices = base_indices
-                else:
-                    neighbor_choice = rng.integers(0, neighbor_matrix.shape[1], size=n_to_generate)
-                    neighbor_indices = neighbor_matrix[base_indices, neighbor_choice]
+    safe_k_neighbors = min(int(k_neighbors), minority_count - 1)
+    if safe_k_neighbors <= 0:
+        diagnostics["skip_reason"] = "可用少数类近邻不足，无法执行 Borderline-SMOTE。"
+        return X_df, y_series, diagnostics
 
-                neighbor_rows = class_rows.iloc[neighbor_indices].reset_index(drop=True)
-                synthetic = base_rows.copy()
-                step = rng.random((n_to_generate, len(numeric_columns)))
-                synthetic[numeric_columns] = base_rows[numeric_columns].to_numpy() + step * (
-                    neighbor_rows[numeric_columns].to_numpy() - base_rows[numeric_columns].to_numpy()
-                )
-            else:
-                synthetic = base_rows.copy()
-                neighbor_rows = class_rows.iloc[
-                    rng.integers(0, len(class_rows), size=n_to_generate)
-                ].reset_index(drop=True)
+    max_total_neighbors = max(1, len(y_series) - 1)
+    safe_m_neighbors = min(max_total_neighbors, max(2, safe_k_neighbors + 1))
 
-            for column in categorical_columns:
-                pick_base = rng.random(n_to_generate) < 0.5
-                synthetic[column] = np.where(pick_base, base_rows[column], neighbor_rows[column])
+    try:
+        from imblearn.over_sampling import BorderlineSMOTE
+    except ImportError as exc:  # pragma: no cover - 依赖是否存在取决于运行环境
+        raise ImportError(
+            "当前训练路径需要 imbalanced-learn 才能执行 Borderline-SMOTE，请先安装 requirements.txt 中的新依赖。"
+        ) from exc
 
-        generated_batches.append(synthetic)
-        generated_labels.append(pd.Series([class_label] * n_to_generate, name=y_series.name))
+    try:
+        sampler = BorderlineSMOTE(
+            sampling_strategy=float(sampling_strategy),
+            random_state=random_state,
+            k_neighbors=safe_k_neighbors,
+            m_neighbors=safe_m_neighbors,
+            kind=DEFAULT_BORDERLINE_SMOTE_KIND,
+        )
+        X_resampled, y_resampled = sampler.fit_resample(X_df, y_series)
+    except ValueError as exc:
+        diagnostics["skip_reason"] = f"Borderline-SMOTE 未成功执行: {exc}"
+        return X_df, y_series, diagnostics
 
-    if generated_batches:
-        X_resampled = pd.concat([X_df] + generated_batches, ignore_index=True)
-        y_resampled = pd.concat([y_series] + generated_labels, ignore_index=True)
-        order = rng.permutation(len(y_resampled))
-        X_resampled = X_resampled.iloc[order].reset_index(drop=True)
-        y_resampled = y_resampled.iloc[order].reset_index(drop=True)
-    else:
-        X_resampled = X_df
-        y_resampled = y_series
+    X_resampled_df = pd.DataFrame(X_resampled, columns=X_df.columns).reset_index(drop=True)
+    y_resampled_series = pd.Series(y_resampled, name=y_series.name).reset_index(drop=True)
 
-    return X_resampled, y_resampled
+    diagnostics["output_class_counts"] = summarize_binary_class_counts(y_resampled_series)
+    diagnostics["positive_ratio_after"] = compute_positive_class_ratio(y_resampled_series)
+    diagnostics["applied"] = True
+
+    return X_resampled_df, y_resampled_series, diagnostics
 
 
 def compute_binary_classification_metrics(
@@ -495,46 +585,165 @@ def probe_binary_classification_thresholds(
     return pd.DataFrame(rows).sort_values("threshold").reset_index(drop=True)
 
 
+def compute_probability_calibration_metrics(
+    y_true: pd.Series | np.ndarray | list[Any],
+    positive_proba: pd.Series | np.ndarray | list[float],
+) -> Dict[str, float]:
+    y_true_array = np.asarray(y_true, dtype=int)
+    positive_proba_array = np.clip(np.asarray(positive_proba, dtype=float), 0.0, 1.0)
+    metrics = {
+        "brier_score": float(brier_score_loss(y_true_array, positive_proba_array)),
+    }
+    if np.unique(y_true_array).size >= 2:
+        metrics["auc"] = float(roc_auc_score(y_true_array, positive_proba_array))
+    else:
+        metrics["auc"] = float("nan")
+    return metrics
+
+
+def apply_probability_calibrator(
+    positive_proba: pd.Series | np.ndarray | list[float],
+    calibration_bundle: Optional[Dict[str, Any]] = None,
+) -> np.ndarray:
+    positive_proba_array = np.clip(np.asarray(positive_proba, dtype=float), 0.0, 1.0)
+    if not calibration_bundle:
+        return positive_proba_array
+
+    calibrator = calibration_bundle.get("calibrator")
+    resolved_method = normalize_probability_calibration_method(
+        calibration_bundle.get("method", calibration_bundle.get("requested_method"))
+    )
+    if calibrator is None:
+        return positive_proba_array
+
+    if resolved_method == "isotonic":
+        calibrated = calibrator.predict(positive_proba_array)
+    else:
+        calibrated = calibrator.predict_proba(positive_proba_array.reshape(-1, 1))[:, 1]
+    return np.clip(np.asarray(calibrated, dtype=float), 0.0, 1.0)
+
+
+def fit_probability_calibrator(
+    y_true: pd.Series | np.ndarray | list[Any],
+    positive_proba: pd.Series | np.ndarray | list[float],
+    method: str = DEFAULT_CALIBRATION_METHOD,
+    random_state: int = 42,
+) -> Dict[str, Any]:
+    y_true_array = np.asarray(y_true, dtype=int)
+    positive_proba_array = np.clip(np.asarray(positive_proba, dtype=float), 0.0, 1.0)
+    if np.unique(y_true_array).size < 2:
+        raise ValueError("概率校准要求输入标签同时包含正类与负类。")
+
+    requested_method = normalize_probability_calibration_method(method)
+    class_counts = summarize_binary_class_counts(y_true_array)
+    min_class_count = int(min(class_counts.values()))
+    unique_score_count = int(np.unique(np.round(positive_proba_array, 12)).size)
+
+    fallback_reason = None
+    resolved_method = requested_method
+    if requested_method == "auto":
+        resolved_method = (
+            "isotonic" if min_class_count >= 30 and unique_score_count >= 20 else "platt"
+        )
+    elif requested_method == "isotonic" and (min_class_count < 10 or unique_score_count < 10):
+        resolved_method = "platt"
+        fallback_reason = "OOF 分数离散度或最小类别样本数不足，自动退回到 Platt Scaling。"
+
+    if resolved_method == "isotonic":
+        calibrator = IsotonicRegression(out_of_bounds="clip", y_min=0.0, y_max=1.0)
+        calibrator.fit(positive_proba_array, y_true_array)
+    else:
+        calibrator = LogisticRegression(
+            random_state=random_state,
+            solver="lbfgs",
+            max_iter=1000,
+        )
+        calibrator.fit(positive_proba_array.reshape(-1, 1), y_true_array)
+
+    calibration_bundle = {
+        "requested_method": requested_method,
+        "method": resolved_method,
+        "fallback_reason": fallback_reason,
+        "calibrator": calibrator,
+        "sample_count": int(len(y_true_array)),
+        "class_counts": class_counts,
+        "unique_score_count": unique_score_count,
+        "raw_metrics": compute_probability_calibration_metrics(y_true_array, positive_proba_array),
+    }
+    calibration_bundle["calibrated_positive_proba"] = apply_probability_calibrator(
+        positive_proba_array,
+        calibration_bundle,
+    )
+    calibration_bundle["calibrated_metrics"] = compute_probability_calibration_metrics(
+        y_true_array,
+        calibration_bundle["calibrated_positive_proba"],
+    )
+    return calibration_bundle
+
+
+def select_binary_classification_threshold(
+    threshold_frame: pd.DataFrame,
+    primary_metric: str = "F1",
+    initial_threshold: float = DEFAULT_INITIAL_THRESHOLD,
+) -> Dict[str, Any]:
+    allowed_metrics = {
+        "Accuracy",
+        "Balanced Accuracy",
+        "Precision",
+        "Recall",
+        "F1",
+        "Specificity",
+    }
+    if primary_metric not in allowed_metrics:
+        raise ValueError(f"threshold 选择指标必须属于 {sorted(allowed_metrics)}")
+
+    ranked = threshold_frame.copy()
+    ranked["distance_to_initial_threshold"] = (
+        ranked["threshold"].astype(float) - float(initial_threshold)
+    ).abs()
+    priority_map = {
+        "F1": ["F1", "Balanced Accuracy", "Recall", "Specificity"],
+        "Balanced Accuracy": ["Balanced Accuracy", "F1", "Recall", "Specificity"],
+        "Recall": ["Recall", "F1", "Balanced Accuracy", "Specificity"],
+        "Precision": ["Precision", "F1", "Balanced Accuracy", "Recall"],
+        "Specificity": ["Specificity", "Balanced Accuracy", "F1", "Recall"],
+        "Accuracy": ["Accuracy", "Balanced Accuracy", "F1", "Recall"],
+    }
+    sort_by = priority_map[primary_metric] + ["distance_to_initial_threshold", "threshold"]
+    ascending = [False] * len(priority_map[primary_metric]) + [True, True]
+    selected = (
+        ranked.sort_values(by=sort_by, ascending=ascending)
+        .iloc[0]
+        .drop(labels=["distance_to_initial_threshold"])
+        .to_dict()
+    )
+    selected["selection_metric"] = primary_metric
+    selected["initial_threshold"] = float(initial_threshold)
+    return selected
+
+
 class FoldSafeSmoteLGBMClassifier(BaseEstimator, ClassifierMixin):
     """
     LightGBM 二分类封装器。
 
-    作用：
-    - 在每个 `fit` 调用内部重新学习缺失值填充值与标准化器，避免 CV 泄漏。
-    - 在当前训练折内部再切一小块验证集，专门用于 early stopping。
-    - 支持在训练折内二选一地使用 SMOTE 或 `scale_pos_weight` 平衡类别。
-    - 统一清洗 `RETENTION_TIME`，把类似 `17.9 and 18.5` 的多值文本解析为均值。
-
-    关键超参数：
-    - `random_state`: 统一控制数据处理、SMOTE 与 LightGBM 的随机性。
-    - `device_type`: 训练设备，项目强制限定为 `cuda`。
-    - `model_n_jobs`: LightGBM 单模型内部线程数。
-    - `balance_strategy`: 类别平衡策略，可选 `smote` 或 `scale_pos_weight`。
-    - `smote_k_neighbors`: 折内 SMOTE 的近邻数。
-    - `scale_pos_weight`: 当使用 `scale_pos_weight` 时传给 LightGBM 的正类权重；为空则按折内训练子集自动计算。
-    - `early_stopping_rounds`: 折内 early stopping 的 patience；设为 0 表示禁用。
-    - `early_stopping_validation_fraction`: 从当前训练折中切出的验证集比例。
-    - `num_leaves`: 单棵树的最大叶子数，越大越容易拟合复杂模式。
-    - `learning_rate`: 每轮 boosting 的步长，越小通常越稳。
-    - `n_estimators`: boosting 轮数，通常与 `learning_rate` 联动。
-    - `max_depth`: 树深上限，用于限制树结构复杂度。
-    - `subsample`: 行采样比例，降低同一批样本反复参与建树的风险。
-    - `colsample_bytree`: 列采样比例，降低特征共适应。
-    - `min_child_samples`: 叶子最少样本数，提高分裂保守性。
-    - `min_split_gain`: 节点继续分裂所需的最小增益。
-    - `reg_alpha`: L1 正则强度，鼓励更稀疏的分裂模式。
-    - `reg_lambda`: L2 正则强度，抑制权重过大。
+    说明：
+    - 保留历史类名以兼容旧 notebook，但内部实现已经收敛成单一路径。
+    - 每个 `fit` 都会在当前训练折内部重新学习填充值与标准化器，避免任何 CV 泄漏。
+    - 先在训练折内部再切一小块 early stopping 验证集；这块验证集绝不参与重采样。
+    - 仅对当前折的训练子集执行 Borderline-SMOTE 增样，用来扩充训练样本量。
+    - `scale_pos_weight` 强制按“重采样后的新标签分布”自动计算，不再允许使用原始比例或手工覆盖。
+    - 外层验证集、OOF 与最终测试集都保持原始不平衡分布，用于真实评估。
     """
 
     def __init__(
         self,
         random_state: int = 42,
         device_type: str = "cuda",
-        model_n_jobs: int = 1,
-        balance_strategy: str = "smote",
+        model_n_jobs: int = 8,
         smote_k_neighbors: int = 5,
+        smote_sampling_strategy: float = DEFAULT_SMOTE_SAMPLING_STRATEGY,
         scale_pos_weight: Optional[float] = None,
-        early_stopping_rounds: int = 100,
+        early_stopping_rounds: int = 300,
         early_stopping_validation_fraction: float = 0.15,
         num_leaves: int = 31,
         learning_rate: float = 0.05,
@@ -550,8 +759,8 @@ class FoldSafeSmoteLGBMClassifier(BaseEstimator, ClassifierMixin):
         self.random_state = random_state
         self.device_type = device_type
         self.model_n_jobs = model_n_jobs
-        self.balance_strategy = balance_strategy
         self.smote_k_neighbors = smote_k_neighbors
+        self.smote_sampling_strategy = smote_sampling_strategy
         self.scale_pos_weight = scale_pos_weight
         self.early_stopping_rounds = early_stopping_rounds
         self.early_stopping_validation_fraction = early_stopping_validation_fraction
@@ -566,24 +775,12 @@ class FoldSafeSmoteLGBMClassifier(BaseEstimator, ClassifierMixin):
         self.reg_alpha = reg_alpha
         self.reg_lambda = reg_lambda
 
-    def _resolve_balance_strategy(self) -> str:
-        resolved = str(self.balance_strategy).strip().lower()
-        if resolved not in {"smote", "scale_pos_weight"}:
-            raise ValueError("balance_strategy 只支持 'smote' 或 'scale_pos_weight'。")
-        return resolved
-
     def _resolve_training_scale_pos_weight(self, y_train: pd.Series) -> float:
         if self.scale_pos_weight is not None:
-            resolved = float(self.scale_pos_weight)
-            if resolved <= 0:
-                raise ValueError("scale_pos_weight 必须为正数。")
-            return resolved
-
-        negative_count = int((y_train == 0).sum())
-        positive_count = int((y_train == 1).sum())
-        if positive_count <= 0:
-            raise ValueError("训练数据中缺少正类样本，无法自动计算 scale_pos_weight。")
-        return float(negative_count / positive_count)
+            raise ValueError(
+                "当前训练路径强制根据折内重采样后的标签分布自动计算 scale_pos_weight，不支持手动指定。"
+            )
+        return compute_scale_pos_weight_from_labels(y_train)
 
     def _split_early_stopping_validation(
         self,
@@ -628,6 +825,7 @@ class FoldSafeSmoteLGBMClassifier(BaseEstimator, ClassifierMixin):
             random_state=self.random_state,
             n_jobs=self.model_n_jobs,
             subsample_freq=1,
+            max_bin=DEFAULT_LGBM_MAX_BIN,
             num_leaves=self.num_leaves,
             learning_rate=self.learning_rate,
             n_estimators=self.n_estimators,
@@ -645,20 +843,23 @@ class FoldSafeSmoteLGBMClassifier(BaseEstimator, ClassifierMixin):
     def fit(self, X: pd.DataFrame, y: pd.Series):
         if self.smote_k_neighbors <= 0:
             raise ValueError("smote_k_neighbors 必须为正整数。")
+        if not 0.0 < float(self.smote_sampling_strategy) <= 1.0:
+            raise ValueError("smote_sampling_strategy 必须在 0 和 1 之间。")
         if self.early_stopping_rounds < 0:
             raise ValueError("early_stopping_rounds 不能为负数。")
+        if self.model_n_jobs <= 0:
+            raise ValueError("model_n_jobs 必须为正整数。")
 
         X_df = X.copy() if isinstance(X, pd.DataFrame) else pd.DataFrame(X)
         y_series = y.copy() if isinstance(y, pd.Series) else pd.Series(y, name="target")
         y_series = y_series.reset_index(drop=True)
         X_df = X_df.reset_index(drop=True)
 
-        self.fit_class_counts_ = y_series.value_counts().sort_index().to_dict()
-        self.balance_strategy_ = self._resolve_balance_strategy()
+        self.fit_class_counts_ = summarize_binary_class_counts(y_series)
 
         X_fit, X_eval, y_fit, y_eval = self._split_early_stopping_validation(X_df, y_series)
-        self.train_split_class_counts_ = y_fit.value_counts().sort_index().to_dict()
-        self.eval_split_class_counts_ = y_eval.value_counts().sort_index().to_dict()
+        self.train_split_class_counts_ = summarize_binary_class_counts(y_fit)
+        self.eval_split_class_counts_ = summarize_binary_class_counts(y_eval)
 
         self.preprocessor_bundle_ = _fit_lightgbm_preprocessor(X_fit)
         X_fit_processed = transform_lightgbm_features(X_fit, self.preprocessor_bundle_)
@@ -666,21 +867,26 @@ class FoldSafeSmoteLGBMClassifier(BaseEstimator, ClassifierMixin):
         if not X_eval.empty:
             X_eval_processed = transform_lightgbm_features(X_eval, self.preprocessor_bundle_)
 
-        X_model_fit = X_fit_processed
-        y_model_fit = y_fit
-        self.effective_scale_pos_weight_ = 1.0
-        if self.balance_strategy_ == "smote":
-            X_model_fit, y_model_fit = notebook_smote_resample(
-                X_fit_processed,
-                y_fit,
-                random_state=self.random_state,
-                k_neighbors=self.smote_k_neighbors,
-            )
-        else:
-            self.effective_scale_pos_weight_ = self._resolve_training_scale_pos_weight(y_fit)
+        X_model_fit, y_model_fit, self.resampling_metadata_ = resample_training_fold_with_borderline_smote(
+            X_fit_processed,
+            y_fit,
+            random_state=self.random_state,
+            k_neighbors=self.smote_k_neighbors,
+            sampling_strategy=self.smote_sampling_strategy,
+        )
 
-        self.model_fit_class_counts_ = y_model_fit.value_counts().sort_index().to_dict()
+        self.pre_resample_scale_pos_weight_ = compute_scale_pos_weight_from_labels(y_fit)
+        self.effective_scale_pos_weight_ = self._resolve_training_scale_pos_weight(y_model_fit)
+        self.scale_pos_weight_source_ = "post_resample_ratio"
+        self.model_fit_class_counts_ = summarize_binary_class_counts(y_model_fit)
         self.resampled_class_counts_ = self.model_fit_class_counts_
+        self.resampler_name_ = self.resampling_metadata_.get("resampler")
+        self.training_positive_ratio_before_resampling_ = self.resampling_metadata_.get(
+            "positive_ratio_before"
+        )
+        self.training_positive_ratio_after_resampling_ = self.resampling_metadata_.get(
+            "positive_ratio_after"
+        )
         self.used_early_stopping_ = bool(self.early_stopping_rounds > 0 and X_eval_processed is not None)
 
         self.model_ = self._build_model(
@@ -820,19 +1026,19 @@ def validate_lightgbm_cuda_build(
 def build_lgbm_classifier(
     random_state: int = 42,
     device_type: str = "cuda",
-    model_n_jobs: int = 1,
-    balance_strategy: str = "smote",
+    model_n_jobs: Optional[int] = None,
     smote_k_neighbors: int = 5,
+    smote_sampling_strategy: float = DEFAULT_SMOTE_SAMPLING_STRATEGY,
     scale_pos_weight: Optional[float] = None,
-    early_stopping_rounds: int = 100,
+    early_stopping_rounds: int = 300,
     early_stopping_validation_fraction: float = 0.15,
 ):
     return FoldSafeSmoteLGBMClassifier(
         random_state=random_state,
         device_type=device_type,
-        model_n_jobs=model_n_jobs,
-        balance_strategy=balance_strategy,
+        model_n_jobs=resolve_recommended_model_n_jobs(model_n_jobs),
         smote_k_neighbors=smote_k_neighbors,
+        smote_sampling_strategy=smote_sampling_strategy,
         scale_pos_weight=scale_pos_weight,
         early_stopping_rounds=early_stopping_rounds,
         early_stopping_validation_fraction=early_stopping_validation_fraction,
@@ -846,9 +1052,34 @@ def _make_json_safe(value: Any) -> Any:
         return {str(key): _make_json_safe(item) for key, item in value.items()}
     if isinstance(value, (list, tuple)):
         return [_make_json_safe(item) for item in value]
+    if isinstance(value, np.ndarray):
+        return value.tolist()
     if isinstance(value, np.generic):
         return value.item()
     return value
+
+
+def _compact_probability_calibration_bundle(
+    probability_calibration_bundle: Optional[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    if not probability_calibration_bundle:
+        return None
+
+    compact_bundle = dict(probability_calibration_bundle)
+    compact_bundle.pop("calibrated_positive_proba", None)
+    return compact_bundle
+
+
+def _probability_calibration_manifest_metadata(
+    probability_calibration_bundle: Optional[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    compact_bundle = _compact_probability_calibration_bundle(probability_calibration_bundle)
+    if not compact_bundle:
+        return None
+
+    manifest_bundle = dict(compact_bundle)
+    manifest_bundle.pop("calibrator", None)
+    return _make_json_safe(manifest_bundle)
 
 
 def save_lightgbm_inference_artifacts(
@@ -863,8 +1094,11 @@ def save_lightgbm_inference_artifacts(
     random_seed: Optional[int] = None,
     test_size: Optional[float] = None,
     smote_k_neighbors: Optional[int] = None,
+    smote_sampling_strategy: Optional[float] = None,
     scoring: Optional[str] = None,
-    classification_threshold: float = 0.5,
+    classification_threshold: float = DEFAULT_INITIAL_THRESHOLD,
+    probability_calibration_bundle: Optional[Dict[str, Any]] = None,
+    threshold_selection_metadata: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Path]:
     model_path = Path(model_path)
     preprocessor_path = Path(preprocessor_path)
@@ -880,8 +1114,14 @@ def save_lightgbm_inference_artifacts(
         if hasattr(estimator, "get_preprocessor_bundle")
         else {}
     )
+    compact_probability_calibration_bundle = _compact_probability_calibration_bundle(
+        probability_calibration_bundle
+    )
+    probability_calibration_metadata = _probability_calibration_manifest_metadata(
+        probability_calibration_bundle
+    )
     preprocessor_bundle = {
-        "artifacts_version": 1,
+        "artifacts_version": ARTIFACTS_VERSION,
         "target_column": target_column,
         "raw_feature_columns": estimator_preprocessor.get(
             "raw_feature_columns",
@@ -915,8 +1155,13 @@ def save_lightgbm_inference_artifacts(
         "retention_time_diagnostics": estimator_preprocessor.get("retention_time_diagnostics"),
         "classes_": list(getattr(estimator, "classes_", [])),
         "classification_threshold": classification_threshold,
-        "balance_strategy": getattr(estimator, "balance_strategy_", None),
+        "threshold_selection_metadata": threshold_selection_metadata,
+        "probability_calibration_bundle": compact_probability_calibration_bundle,
+        "resampler_name": getattr(estimator, "resampler_name_", None),
+        "resampling_metadata": getattr(estimator, "resampling_metadata_", None),
+        "pre_resample_scale_pos_weight": getattr(estimator, "pre_resample_scale_pos_weight_", None),
         "effective_scale_pos_weight": getattr(estimator, "effective_scale_pos_weight_", None),
+        "scale_pos_weight_source": getattr(estimator, "scale_pos_weight_source_", None),
         "early_stopping_rounds": getattr(estimator, "early_stopping_rounds", None),
         "early_stopping_validation_fraction": getattr(
             estimator,
@@ -928,7 +1173,7 @@ def save_lightgbm_inference_artifacts(
     joblib.dump(preprocessor_bundle, preprocessor_path)
 
     manifest = {
-        "artifacts_version": 1,
+        "artifacts_version": ARTIFACTS_VERSION,
         "model_path": model_path,
         "preprocessor_path": preprocessor_path,
         "target_column": target_column,
@@ -947,8 +1192,13 @@ def save_lightgbm_inference_artifacts(
         "dataset_retention_time_diagnostics": prepared.get("retention_time_diagnostics"),
         "classes_": list(getattr(estimator, "classes_", [])),
         "classification_threshold": classification_threshold,
-        "balance_strategy": getattr(estimator, "balance_strategy_", None),
+        "threshold_selection_metadata": threshold_selection_metadata,
+        "probability_calibration": probability_calibration_metadata,
+        "resampler_name": getattr(estimator, "resampler_name_", None),
+        "resampling_metadata": getattr(estimator, "resampling_metadata_", None),
+        "pre_resample_scale_pos_weight": getattr(estimator, "pre_resample_scale_pos_weight_", None),
         "effective_scale_pos_weight": getattr(estimator, "effective_scale_pos_weight_", None),
+        "scale_pos_weight_source": getattr(estimator, "scale_pos_weight_source_", None),
         "early_stopping_rounds": getattr(estimator, "early_stopping_rounds", None),
         "early_stopping_validation_fraction": getattr(
             estimator,
@@ -959,6 +1209,7 @@ def save_lightgbm_inference_artifacts(
         "random_seed": random_seed,
         "test_size": test_size,
         "smote_k_neighbors": smote_k_neighbors,
+        "smote_sampling_strategy": smote_sampling_strategy,
         "scoring": scoring,
     }
     manifest_path.write_text(

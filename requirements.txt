@@ -9,7 +9,9 @@ gunicorn
 scikit-optimize
 matplotlib
 tqdm
-# Training notebook requires a CUDA-enabled LightGBM build.
-# A plain CPU-only wheel will fail the CUDA preflight on purpose.
+# 训练 notebook 使用 Borderline-SMOTE，需要 imbalanced-learn。
+imbalanced-learn
+# 训练 notebook 需要启用 CUDA 的 LightGBM 构建。
+# 仅 CPU 的 wheel 会在预检阶段被明确拒绝。
 lightgbm
 ipywidgets
