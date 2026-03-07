@@ -808,7 +808,8 @@ def select_binary_classification_threshold(
     return selected
 
 
-class FoldSafeSmoteLGBMClassifier(BaseEstimator, ClassifierMixin):
+# sklearn>=1.6 通过 tags 判断 estimator 类型，mixin 需要放在 BaseEstimator 左侧。
+class FoldSafeSmoteLGBMClassifier(ClassifierMixin, BaseEstimator):
     """
     LightGBM 二分类封装器。
 
